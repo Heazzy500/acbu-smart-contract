@@ -395,6 +395,51 @@ fn test_admin_set_rate_negative_fails() {
     assert!(result.is_err());
 }
 
+/// AC-013 (#736): once a rate exists, the admin override is subject to the
+/// update interval — a rewrite within 6h must fail even at small deviation.
+#[test]
+fn test_admin_set_rate_rejects_before_interval() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap (no prior rate)
+
+    // Still within the 6h interval — only 2% away, but too soon.
+    let result = client.try_set_rate_admin(&ngn, &1_020_000i128);
+    assert!(result.is_err(), "admin override before update interval must fail");
+}
+
+/// AC-013 (#736): even after the interval, a deviation beyond the
+/// per-currency emergency threshold (5%) is rejected with AdminDeviationTooLarge
+/// (#7026) — such moves require cast_emergency_vote + update_rate consensus.
+#[test]
+#[should_panic(expected = "#7026")]
+fn test_admin_set_rate_rejects_deviation_above_emergency_threshold() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap
+
+    env.ledger().with_mut(|l| l.timestamp += 21_601); // interval elapsed
+
+    client.set_rate_admin(&ngn, &1_100_000i128); // 10% > 5% threshold
+}
+
+/// AC-013 (#736): a within-threshold adjustment after the interval still works,
+/// so the override remains usable for small emergency corrections.
+#[test]
+fn test_admin_set_rate_within_threshold_after_interval_succeeds() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap
+
+    env.ledger().with_mut(|l| l.timestamp += 21_601);
+
+    client.set_rate_admin(&ngn, &1_040_000i128); // 4% <= 5% threshold
+    assert_eq!(client.get_rate(&ngn), 1_040_000, "client.get_rate(&ngn) should equal 1_040_000");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // BASKET CONFIGURATION TESTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -613,8 +658,10 @@ fn test_admin_override_refreshes_stale_rate() {
         &env.ledger().timestamp(),
     );
 
-    // Advance past staleness
+    // Advance past staleness, and past the update interval so the gated
+    // admin override (AC-013) is eligible to refresh the feed.
     advance_ledger_to(&env, &contract_id, 100 + STALE_RATE_MAX_LEDGERS + 1);
+    env.ledger().with_mut(|l| l.timestamp += 21_601);
 
     // Admin refreshes
     client.set_rate_admin(&ngn, &1_050_000i128);
@@ -682,7 +729,7 @@ fn test_accept_admin_before_timelock_fails() {
 
 #[test]
 fn test_accept_admin_after_timelock_succeeds() {
-    let (env, client, _contract_id, admin, _validators) = setup();
+    let (env, client, _contract_id, _admin, _validators) = setup();
 
     let new_admin = Address::generate(&env);
     client.transfer_admin(&new_admin);
