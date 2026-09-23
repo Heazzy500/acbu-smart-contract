@@ -983,8 +983,17 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        // AC-009 (#732): the treasury fee is minted as new ACBU below, so it
+        // must count toward both the supply-cap/reserve projection and the
+        // tracked total supply — otherwise `get_total_supply()` drifts below
+        // the real circulating supply after every fee-bearing fiat mint.
+        let fee = calculate_fee(usd_gross, fee_rate);
+        let minted_total = acbu_amount
+            .checked_add(fee)
+            .expect("Overflow in minted amount calculation");
+
         let projected_supply = total_supply
-            .checked_add(acbu_amount)
+            .checked_add(minted_total)
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -999,7 +1008,7 @@ impl MintingContract {
         // For mint_from_fiat, fiat deposit is handled off-chain by the fintech partner.
         // No on-chain token transfer needed; fintech validates and deposits fiat in their system.
 
-        total_supply += acbu_amount;
+        total_supply += minted_total;
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -1007,7 +1016,6 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_rate);
         if fee > 0 {
             acbu_sac.mint(&treasury, &fee);
         }
