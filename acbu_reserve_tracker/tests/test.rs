@@ -21,7 +21,7 @@ mod mock_oracle {
     #[contractimpl]
     impl MockOracle {
         pub fn get_acbu_usd_rate(_env: Env) -> i128 {
-            100_000_000 // 1 USD (8 decimals)
+            shared::DECIMALS // 1 USD (7 decimals, same as the real oracle)
         }
 
         pub fn get_rate_with_timestamp(env: Env, currency: CurrencyCode) -> (i128, u64) {
@@ -188,7 +188,8 @@ fn test_is_reserve_sufficient_multiple_currencies_and_verify_from_token() {
     // supply 10 ACBU (10 * DECIMALS) → sufficient
     assert!(client.verify_reserves_manual(&(10 * DECIMALS)));
 
-    // supply 20 ACBU → insufficient
+    // supply 20 ACBU → insufficient (AC-002: a 10^8 divisor would value this
+    // at 2 USD and wrongly report sufficient)
     assert!(!client.verify_reserves_manual(&(20 * DECIMALS)));
 
     // verify_reserves reads MockToken which returns 10 * DECIMALS → sufficient
@@ -552,7 +553,7 @@ fn test_submit_attestation_without_custodian_identity_fails() {
 
     let mut root_buf = Bytes::new(&env);
     root_buf.extend_from_slice(&[0xabu8; 32][..]);
-    let root = env.crypto().keccak256(&root_buf);
+    let root = env.crypto().keccak256(&root_buf).to_bytes();
 
     env.mock_auths(&[]);
     let result = client.try_submit_attestation(&root);
@@ -683,7 +684,7 @@ fn test_verify_merkle_proof_invalid_proof_panics() {
 
     let mut fake_buf = Bytes::new(&env);
     fake_buf.extend_from_slice(&[0xabu8; 32][..]);
-    let fake_sibling = env.crypto().keccak256(&fake_buf);
+    let fake_sibling = env.crypto().keccak256(&fake_buf).to_bytes();
     let bad_proof = vec![&env, fake_sibling];
 
     let result = client.try_verify_merkle_proof(&leaf, &bad_proof, &0u32);

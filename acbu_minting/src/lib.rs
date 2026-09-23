@@ -18,7 +18,7 @@ use shared::{
 pub mod token_contract {
     soroban_sdk::contractimport!(
         file = "../soroban_token_contract.wasm",
-        sha256 = "fff46d90821401584414ee6afc5ef36d99e95ef7e37d8652ad3e6c4a4e099dc0"
+        sha256 = "6b14997b915dee21082884cd5a2f1f2f0aef0073d1dcb9c5b3c674cf487fb41d"
     );
 }
 
@@ -53,6 +53,7 @@ pub struct DataKey {
     pub used_proofs: Symbol,
     pub processed_fintech_tx_ids: Symbol,
     pub max_supply: Symbol,
+    pub max_drip: Symbol,
     pub pending_admin: Symbol,
     pub pending_admin_eligible_at: Symbol,
     /// Prefix for persistent per-proof replay-prevention keys: `(proof_prefix, proof_id)`.
@@ -79,6 +80,7 @@ const DATA_KEY: DataKey = DataKey {
     used_proofs: symbol_short!("PROOFS"),
     processed_fintech_tx_ids: symbol_short!("FTX_IDS"),
     max_supply: symbol_short!("MAX_SUP"),
+    max_drip: symbol_short!("MAX_DRIP"),
     pending_admin: symbol_short!("PEND_ADM"),
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
     proof_prefix: symbol_short!("PRF_SET"),
@@ -123,6 +125,11 @@ pub enum MintingError {
     InvalidRecipient = 5023,
     InvalidRoleSeparation = 5024,
     SupplyMismatch = 5025,
+    NegativeSupply = 5027,
+    /// The computed ACBU output is below the caller-supplied `min_acbu_out`
+    /// floor, indicating that same-block oracle movement would cause unacceptable
+    /// slippage. The transaction should be retried with updated parameters.
+    SlippageExceeded = 5026,
     Unknown = 5999,
 }
 
@@ -152,8 +159,10 @@ impl Display for MintingError {
             Self::AdminTimelockNotElapsed => "admin timelock has not elapsed",
             Self::NoPendingAdminToCancel => "no pending admin to cancel",
             Self::InvalidRecipient => "invalid recipient",
-            Self::InvalidRoleSeparation => "invalid role separation",
+            Self::InvalidRoleSeparation => "admin and operator must be different addresses",
             Self::SupplyMismatch => "supplied value does not match on-chain supply",
+            Self::SlippageExceeded => "output below minimum: slippage exceeded",
+            Self::NegativeSupply => "negative supply",
             Self::Unknown => "unknown minting error",
         };
         f.write_str(message)
@@ -277,11 +286,24 @@ impl MintingContract {
             .set(&DATA_KEY.max_supply, &MAX_TOTAL_SUPPLY);
         env.storage()
             .instance()
+            .set(&DATA_KEY.max_drip, &100_000_000_000_000i128);
+        env.storage()
+            .instance()
             .set(&SharedDataKey::Version, &CONTRACT_VERSION);
     }
 
     /// Mint ACBU from USDC deposit (unchanged reserve/oracle flow).
-    pub fn mint_from_usdc(env: Env, user: Address, usdc_amount: i128, recipient: Address) -> i128 {
+    ///
+    /// `min_acbu_out` is an optional slippage guard: if the computed ACBU amount
+    /// is below this value the transaction reverts with `SlippageExceeded`.
+    /// Pass `None` to disable the check (backwards-compatible default).
+    pub fn mint_from_usdc(
+        env: Env,
+        user: Address,
+        usdc_amount: i128,
+        recipient: Address,
+        min_acbu_out: Option<i128>,
+    ) -> i128 {
         // Re-entrancy guard
         reentrancy_guard::acquire_guard(&env);
 
@@ -289,7 +311,8 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
+        env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
             .storage()
@@ -336,6 +359,13 @@ impl MintingContract {
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .unwrap_or_else(|| env.panic_with_error(MintingError::InvalidMintAmount));
+
+        // Slippage guard: reject if computed output is below caller's minimum.
+        if let Some(floor) = min_acbu_out {
+            if acbu_amount < floor {
+                env.panic_with_error(MintingError::SlippageExceeded);
+            }
+        }
 
         let projected_supply = total_supply
             .checked_add(acbu_amount)
@@ -402,11 +432,12 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
 
         if !check_proof_unused(&env, &proof_id) {
             env.panic_with_error(MintingError::ProofAlreadyUsed);
         }
+        env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
             .storage()
@@ -579,7 +610,8 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
+        env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
             .storage()
@@ -718,6 +750,7 @@ impl MintingContract {
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
         Self::assert_recipient_is_account(&recipient);
+        env.storage().instance().extend_ttl(5184000, 5184000);
 
         if !check_proof_unused(&env, &proof_id) {
             env.panic_with_error(MintingError::ProofAlreadyUsed);
@@ -860,10 +893,15 @@ impl MintingContract {
         }
         operator.require_auth();
 
+        // C-058: reject contract-type recipients — minting to a contract address
+        // that has no token-receipt logic would permanently strand the funds.
+        Self::assert_recipient_is_account(&recipient);
+
         // C-039: Strict input validation — enforce length bounds and charset
         // before touching any storage, so garbage IDs are rejected cheaply.
         validate_fintech_tx_id(&env, &fintech_tx_id);
         let normalized_tx_id = normalize_fintech_tx_id(&env, &fintech_tx_id);
+        env.storage().instance().extend_ttl(5184000, 5184000);
 
         // Check if fintech_tx_id has already been processed
         let mut processed_ids: soroban_sdk::Map<SorobanString, bool> = env
@@ -894,7 +932,10 @@ impl MintingContract {
             .instance()
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
-        let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        // C-038: `mint_from_fiat` never moves on-chain custody funds — the fiat
+        // deposit is validated and settled off-chain by the fintech partner —
+        // so unlike the other mint paths there is no vault transfer to route,
+        // and the vault address does not need to be loaded here.
         let fee_rate: i128 = env.storage().instance().get(&DATA_KEY.fee_rate).unwrap();
         let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let mut total_supply: i128 = env
@@ -942,8 +983,17 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        // AC-009 (#732): the treasury fee is minted as new ACBU below, so it
+        // must count toward both the supply-cap/reserve projection and the
+        // tracked total supply — otherwise `get_total_supply()` drifts below
+        // the real circulating supply after every fee-bearing fiat mint.
+        let fee = calculate_fee(usd_gross, fee_rate);
+        let minted_total = acbu_amount
+            .checked_add(fee)
+            .expect("Overflow in minted amount calculation");
+
         let projected_supply = total_supply
-            .checked_add(acbu_amount)
+            .checked_add(minted_total)
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -958,7 +1008,7 @@ impl MintingContract {
         // For mint_from_fiat, fiat deposit is handled off-chain by the fintech partner.
         // No on-chain token transfer needed; fintech validates and deposits fiat in their system.
 
-        total_supply += acbu_amount;
+        total_supply += minted_total;
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -966,7 +1016,6 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_rate);
         if fee > 0 {
             acbu_sac.mint(&treasury, &fee);
         }
@@ -1023,8 +1072,13 @@ impl MintingContract {
         if amount <= 0 {
             env.panic_with_error(MintingError::InvalidDripAmount);
         }
-        const MAX_DRIP: i128 = 100_000_000_000_000; // 10M whole units at 7 decimals
-        if amount > MAX_DRIP {
+        env.storage().instance().extend_ttl(5184000, 5184000);
+        let max_drip: i128 = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.max_drip)
+            .unwrap_or(100_000_000_000_000i128);
+        if amount > max_drip {
             env.panic_with_error(MintingError::DripExceedsCap);
         }
 
@@ -1059,8 +1113,8 @@ impl MintingContract {
     /// admin to preserve role separation, otherwise it reverts with
     /// `InvalidRoleSeparation`.
     pub fn set_operator(env: Env, new_operator: Address) {
-        Self::check_admin(&env);
-        let admin = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
         if admin == new_operator {
             env.panic_with_error(MintingError::InvalidRoleSeparation);
         }
@@ -1090,11 +1144,28 @@ impl MintingContract {
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
         Self::check_paused(&env);
+
+        // SC-035 (1): reject negative values — supply can never be below zero.
+        if new_supply < 0 {
+            env.panic_with_error(MintingError::NegativeSupply);
+        }
+
+        // SC-035 (2): cross-check against the token contract's on-chain
+        // total_supply so the minting contract's internal counter stays in sync
+        // with the actual circulating supply.
+        //
+        // C-036: `soroban_sdk::token::Client` (the SEP-41 interface) does not
+        // expose `total_supply()`, so the on-chain value is read via
+        // `invoke_contract` against the token's `TOKEN_GET_TOTAL_SUPPLY` entry
+        // point instead.
         Self::check_supply_cap(&env, new_supply);
 
         let acbu_token: Address = env.storage().instance().get(&DATA_KEY.acbu_token).unwrap();
-        let token = soroban_sdk::token::Client::new(&env, &acbu_token);
-        let on_chain_supply = token.total_supply();
+        let on_chain_supply: i128 = env.invoke_contract(
+            &acbu_token,
+            &Symbol::new(&env, shared::TOKEN_GET_TOTAL_SUPPLY),
+            vec![&env],
+        );
         if new_supply != on_chain_supply {
             env.panic_with_error(MintingError::SupplyMismatch);
         }
@@ -1150,6 +1221,25 @@ impl MintingContract {
             timestamp: env.ledger().timestamp(),
         };
         env.events().publish((symbol_short!("max_sup"),), event);
+    }
+
+    pub fn get_max_drip(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.max_drip)
+            .unwrap_or(100_000_000_000_000i128)
+    }
+
+    pub fn set_max_drip(env: Env, new_max_drip: i128) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        Self::check_paused(&env);
+        if new_max_drip < 0 {
+            env.panic_with_error(MintingError::InvalidDripAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.max_drip, &new_max_drip);
     }
 
     fn check_supply_cap(env: &Env, projected_supply: i128) {
@@ -1442,12 +1532,30 @@ impl MintingContract {
         env.storage().instance().get(&DATA_KEY.admin).unwrap()
     }
 
-    /// Check if the contract has been initialized.
+/// Check if the contract has been initialized.
     ///
     /// Backend services can call this before invoking other functions to avoid
     /// cryptic storage-not-found errors from uninitialized contracts.
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&SharedDataKey::Version)
+    }
+
+    fn check_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+    }
+
+    fn assert_recipient_is_account(address: &Address) {
+        let env = address.env();
+        let strkey = address.to_string();
+        if strkey.len() != 56 {
+            env.panic_with_error(MintingError::InvalidRecipient);
+        }
+        let mut buf = [0u8; 56];
+        strkey.copy_into_slice(&mut buf);
+        if buf[0] != b'G' {
+            env.panic_with_error(MintingError::InvalidRecipient);
+        }
     }
 
     /// Pending successor, if a transfer is in progress.
@@ -1492,7 +1600,13 @@ impl MintingContract {
         Self::check_paused(&env);
 
         let current_version = Self::get_version(env.clone());
-        if new_version <= current_version {
+
+        // SC-034: enforce single-step increments only.
+        // Allowing new_version > current_version + 1 would silently skip any
+        // migrations registered for the intermediate versions (the `_ => {}`
+        // arms). Each deployment must advance exactly one version so every
+        // migration function is guaranteed to run.
+        if new_version != current_version + 1 {
             env.panic_with_error(MintingError::InvalidVersion);
         }
 
@@ -1561,31 +1675,6 @@ fn next_tx_nonce(env: &Env) -> u64 {
         .expect("transaction nonce overflow");
     env.storage().instance().set(&DATA_KEY.tx_nonce, &nonce);
     nonce
-}
-
-// ---------------------------------------------------------------------------
-// Helper: assert that an address belongs to an account (not a contract).
-// C-058 — minting to a contract address that has no token-receipt logic would
-// permanently strand funds.
-//
-// soroban-sdk 21 does not expose an `is_account()` predicate on `Address`, but
-// the strkey encoding returned by `Address::to_string()` reveals the address
-// kind: standard Stellar account (ed25519 public key) strkeys start with 'G',
-// while contract strkeys start with 'C'. Both encodings are 56 characters
-// long, so any address that doesn't decode to a 56-byte 'G...' string is
-// rejected.
-// ---------------------------------------------------------------------------
-fn assert_recipient_is_account(address: &Address) {
-    let env = address.env();
-    let strkey = address.to_string();
-    if strkey.len() != 56 {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
-    let mut buf = [0u8; 56];
-    strkey.copy_into_slice(&mut buf);
-    if buf[0] != b'G' {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,5 +1758,9 @@ fn normalize_fintech_tx_id(env: &Env, id: &SorobanString) -> SorobanString {
         }
     }
 
-    SorobanString::from_slice(env, slice)
+    // C-039: Convert to &str for Soroban string creation.
+    // The input is already validated as ASCII alphanumeric / hyphen / underscore
+    // (see validate_fintech_tx_id), so from_utf8 will not fail.
+    let normalized = core::str::from_utf8(slice).unwrap_or("");
+    SorobanString::from_str(env, normalized)
 }

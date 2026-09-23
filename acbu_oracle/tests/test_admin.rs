@@ -1,11 +1,14 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
-    Address, Env, IntoVal, Map, Vec,
+    symbol_short,
+    testutils::{Address as _, Events, Ledger, LedgerInfo},
+    Address, Env, FromVal, IntoVal, Map, Symbol, Vec,
 };
 
-use acbu_oracle::{OracleContract, OracleContractClient, ADMIN_TIMELOCK_SECONDS};
+use acbu_oracle::{
+    AdminTransferCancelledEvent, OracleContract, OracleContractClient, ADMIN_TIMELOCK_SECONDS,
+};
 use shared::CurrencyCode;
 
 fn make_env() -> Env {
@@ -77,6 +80,7 @@ fn test_transfer_and_accept_after_timelock() {
 #[test]
 fn test_cancel_clears_pending_state() {
     let (env, _admin, client) = setup();
+    let contract_id = client.address.clone();
     let new_admin = Address::generate(&env);
 
     env.mock_all_auths();
@@ -85,6 +89,21 @@ fn test_cancel_clears_pending_state() {
 
     assert!(client.get_pending_admin().is_none());
     assert_ne!(client.get_admin(), new_admin);
+
+    let cancel_event = env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.0 == contract_id
+                && Symbol::from_val(&env, &event.1.get(0).unwrap()) == symbol_short!("adm_cncl")
+        })
+        .expect("cancel_admin_transfer must emit adm_cncl");
+
+    let decoded: AdminTransferCancelledEvent = cancel_event.2.into_val(&env);
+    assert_eq!(decoded.cancelled_pending, new_admin);
+    assert_eq!(decoded.admin, client.get_admin());
 }
 
 #[test]
@@ -211,7 +230,11 @@ fn test_transfer_admin_requires_current_admin_auth() {
 }
 
 #[test]
-fn test_update_rate_single_submission() {
+#[should_panic(expected = "#7009")]
+fn test_update_rate_rejects_single_submission() {
+    // AC-014 (#737): a single source no longer bypasses aggregation — the
+    // quorum floor (min_signatures, MIN_ORACLE_SOURCE_FEEDS) applies even
+    // when sources.len() == 1.
     let (env, _admin, client) = setup();
     let validators = client.get_validators();
     let validator = validators.get(0).unwrap();
@@ -223,9 +246,6 @@ fn test_update_rate_single_submission() {
     sources.push_back(125_000i128);
 
     client.update_rate(&validator, &currency, &125_000i128, &sources, &0u64);
-
-    let (rate, _ts) = client.get_rate_with_timestamp(&currency);
-    assert_eq!(rate, 125_000i128);
 }
 
 #[test]
