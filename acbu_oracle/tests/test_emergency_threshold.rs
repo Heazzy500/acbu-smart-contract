@@ -58,8 +58,12 @@ fn advance_time(env: &Env, delta: u64) {
     env.ledger().set(make_ledger(now + delta, seq + 1));
 }
 
-fn single_source(env: &Env, rate: i128) -> Vec<i128> {
+/// Three identical feed values — satisfies the `MIN_ORACLE_SOURCE_FEEDS`
+/// quorum (AC-014) while keeping the median at `rate`.
+fn quorum_sources(env: &Env, rate: i128) -> Vec<i128> {
     let mut v = Vec::new(env);
+    v.push_back(rate);
+    v.push_back(rate);
     v.push_back(rate);
     v
 }
@@ -106,7 +110,7 @@ fn seed_rate(
     currency: &CurrencyCode,
     rate: i128,
 ) {
-    client.update_rate(validator, currency, &rate, &single_source(env, rate), &0u64);
+    client.update_rate(validator, currency, &rate, &quorum_sources(env, rate), &0u64);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +130,7 @@ fn test_single_validator_cannot_bypass_alone_no_votes() {
 
     // 10% deviation but zero votes cast — should fall through to interval check.
     let emergency_rate = 1_100_000i128;
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
 }
 
 /// With only 1 vote cast but min_sigs = 2, the bypass is not granted.
@@ -145,7 +149,7 @@ fn test_one_vote_insufficient_for_bypass() {
     assert_eq!(client.get_emergency_vote_count(&ngn), 1u32);
 
     // Attempting the rate update without full consensus fails.
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
 }
 
 /// With min_signatures = 1, a single vote is sufficient to bypass (degenerate case).
@@ -160,7 +164,7 @@ fn test_single_validator_can_bypass_with_min_1() {
     let emergency_rate = 1_100_000i128;
     // Cast one vote and immediately update.
     client.cast_emergency_vote(&v0, &ngn, &emergency_rate);
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 }
 
@@ -187,7 +191,7 @@ fn test_two_of_three_consensus_grants_bypass() {
     assert_eq!(client.get_emergency_vote_count(&ngn), 2u32, "should have 2 votes");
 
     // Bypass granted — only one validator needs to call update_rate to commit.
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 
     // After the bypass, votes are consumed.
@@ -213,7 +217,7 @@ fn test_three_of_five_consensus_grants_bypass() {
     // 2 votes, need 3 — bypass not yet available.
     assert!(
         client
-            .try_update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64)
+            .try_update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64)
             .is_err(),
         "2 votes insufficient for 3-of-5"
     );
@@ -221,7 +225,7 @@ fn test_three_of_five_consensus_grants_bypass() {
     client.cast_emergency_vote(&v2, &ngn, &emergency_rate);
 
     // 3 votes — bypass fires.
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 }
 
@@ -254,7 +258,7 @@ fn test_expired_votes_do_not_count() {
     assert_eq!(client.get_emergency_vote_count(&ngn), 1u32, "expired vote not counted");
 
     // Attempting bypass with only 1 live vote fails.
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +327,7 @@ fn test_stricter_threshold_blocks_6pct_deviation() {
 
     // 6% deviation — below 10% threshold → normal interval check fires.
     let rate_6pct = 1_060_000i128;
-    client.update_rate(&v0, &ngn, &rate_6pct, &single_source(&env, rate_6pct), &0u64);
+    client.update_rate(&v0, &ngn, &rate_6pct, &quorum_sources(&env, rate_6pct), &0u64);
 }
 
 /// A permissive per-currency threshold (200 bps / 2%) means a 3% deviation triggers
@@ -340,7 +344,7 @@ fn test_permissive_threshold_needs_votes_for_3pct_deviation() {
 
     // 3% deviation (300 bps) exceeds the 2% threshold — emergency path — but no votes.
     let rate_3pct = 1_030_000i128;
-    client.update_rate(&v0, &ngn, &rate_3pct, &single_source(&env, rate_3pct), &0u64);
+    client.update_rate(&v0, &ngn, &rate_3pct, &quorum_sources(&env, rate_3pct), &0u64);
 }
 
 /// With a permissive threshold (2%), N-of-M votes on a 3% move allow the bypass.
@@ -358,7 +362,7 @@ fn test_permissive_threshold_2_votes_allow_3pct_bypass() {
     client.cast_emergency_vote(&v0, &ngn, &rate_3pct);
     client.cast_emergency_vote(&v1, &ngn, &rate_3pct);
 
-    client.update_rate(&v0, &ngn, &rate_3pct, &single_source(&env, rate_3pct), &0u64);
+    client.update_rate(&v0, &ngn, &rate_3pct, &quorum_sources(&env, rate_3pct), &0u64);
     assert_eq!(client.get_rate(&ngn), rate_3pct);
 }
 
@@ -393,14 +397,14 @@ fn test_set_min_signatures_clears_pending_votes() {
     client.cast_emergency_vote(&v0, &ngn, &emergency_rate);
     assert!(
         client
-            .try_update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64)
+            .try_update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64)
             .is_err(),
         "1 vote not enough for quorum 2"
     );
 
     // v1 re-casts — now 2 votes, consensus with new quorum = 2.
     client.cast_emergency_vote(&v1, &ngn, &emergency_rate);
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    client.update_rate(&v0, &ngn, &emergency_rate, &quorum_sources(&env, emergency_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 }
 
@@ -434,7 +438,7 @@ fn test_normal_update_after_interval_succeeds() {
     advance_time(&env, UPDATE_INTERVAL + 1);
 
     let new_rate = 1_010_000i128; // 1% move
-    client.update_rate(&v0, &ngn, &new_rate, &single_source(&env, new_rate), &0u64);
+    client.update_rate(&v0, &ngn, &new_rate, &quorum_sources(&env, new_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), new_rate);
 }
 
@@ -448,7 +452,7 @@ fn test_large_move_after_interval_is_normal() {
     advance_time(&env, UPDATE_INTERVAL + 1);
 
     let new_rate = 1_200_000i128; // 20% move — interval already passed
-    client.update_rate(&v0, &ngn, &new_rate, &single_source(&env, new_rate), &0u64);
+    client.update_rate(&v0, &ngn, &new_rate, &quorum_sources(&env, new_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), new_rate);
 }
 
@@ -457,7 +461,7 @@ fn test_large_move_after_interval_is_normal() {
 fn test_first_rate_write_never_blocked() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
-    client.update_rate(&v0, &ngn, &999_999i128, &single_source(&env, 999_999i128), &0u64);
+    client.update_rate(&v0, &ngn, &999_999i128, &quorum_sources(&env, 999_999i128), &0u64);
     assert_eq!(client.get_rate(&ngn), 999_999i128);
 }
 
@@ -505,20 +509,20 @@ fn test_votes_are_independent_per_currency() {
     client.cast_emergency_vote(&v0, &kes, &emrg);
 
     // NGN has 2 votes → bypass available.
-    client.update_rate(&v0, &ngn, &emrg, &single_source(&env, emrg), &0u64);
+    client.update_rate(&v0, &ngn, &emrg, &quorum_sources(&env, emrg), &0u64);
     assert_eq!(client.get_rate(&ngn), emrg, "NGN should be updated");
 
     // KES still has only 1 vote — bypass not yet available.
     assert!(
         client
-            .try_update_rate(&v0, &kes, &emrg, &single_source(&env, emrg), &0u64)
+            .try_update_rate(&v0, &kes, &emrg, &quorum_sources(&env, emrg), &0u64)
             .is_err(),
         "KES should still need another vote"
     );
 
     // Add second KES vote.
     client.cast_emergency_vote(&v1, &kes, &emrg);
-    client.update_rate(&v0, &kes, &emrg, &single_source(&env, emrg), &0u64);
+    client.update_rate(&v0, &kes, &emrg, &quorum_sources(&env, emrg), &0u64);
     assert_eq!(client.get_rate(&kes), emrg, "KES should be updated");
 }
 
