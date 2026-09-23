@@ -182,6 +182,7 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 7023 | `RateNotInitialized` | rate not initialized - no submissions yet |
 | 7024 | `CurrencyNotRegistered` | currency not registered |
 | 7025 | `InsufficientEmergencyVotes` | Emergency vote cast but consensus not yet reached — caller must wait for more validators to submit corroborating emergency rates. |
+| 7026 | `AdminDeviationTooLarge` | AC-013 (#736): admin rate override deviates beyond the per-currency emergency threshold — larger moves must go through `cast_emergency_vote` + `update_rate` N-of-M validator consensus instead. |
 | 7999 | `Unknown` | unknown oracle error |
 
 ## `acbu_reserve_tracker` - `ReserveTrackerError`
