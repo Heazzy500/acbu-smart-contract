@@ -203,7 +203,11 @@ impl ReserveTrackerContract {
         let last_call: Option<u64> = env.storage().instance().get(&DATA_KEY.last_verify_call);
         if let Some(last) = last_call {
             if now.saturating_sub(last) < VERIFY_RESERVES_COOLDOWN_SECONDS {
-                return true;
+                if let Some(cached): Option<bool> =
+                    env.storage().instance().get(&DATA_KEY.last_verify_result)
+                {
+                    return cached;
+                }
             }
         }
 
