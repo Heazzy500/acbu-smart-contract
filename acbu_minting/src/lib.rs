@@ -903,14 +903,8 @@ impl MintingContract {
         let normalized_tx_id = normalize_fintech_tx_id(&env, &fintech_tx_id);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
-        // Check if fintech_tx_id has already been processed
-        let mut processed_ids: soroban_sdk::Map<SorobanString, bool> = env
-            .storage()
-            .instance()
-            .get(&DATA_KEY.processed_fintech_tx_ids)
-            .unwrap_or_else(|| soroban_sdk::map![&env]);
-
-        if processed_ids.contains_key(normalized_tx_id.clone()) {
+        // AC-024: Check if fintech_tx_id has already been processed in persistent storage
+        if is_fintech_tx_id_processed(&env, &normalized_tx_id) {
             env.panic_with_error(MintingError::DuplicateFintechTxId);
         }
 
@@ -1020,11 +1014,8 @@ impl MintingContract {
             acbu_sac.mint(&treasury, &fee);
         }
 
-        // Mark fintech_tx_id as processed to prevent duplicate minting
-        processed_ids.set(normalized_tx_id.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DATA_KEY.processed_fintech_tx_ids, &processed_ids);
+        // AC-024: Mark fintech_tx_id as processed in persistent storage with TTL to prevent unbounded instance-storage growth
+        mark_fintech_tx_id_processed(&env, &normalized_tx_id);
 
         let mint_event = MintEvent {
             transaction_id: normalized_tx_id,
@@ -1690,6 +1681,21 @@ fn mark_proof_used(env: &Env, proof_id: &SorobanString) {
     env.storage()
         .persistent()
         .set(&(DATA_KEY.proof_prefix, proof_id.clone()), &true);
+}
+
+// ---------------------------------------------------------------------------
+// AC-024: Fintech tx ID deduplication helpers: prevent double-spend in mint_from_fiat.
+// Uses per-key persistent storage instead of growing an unbounded Map in instance storage.
+// ---------------------------------------------------------------------------
+fn is_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) -> bool {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().has(&key)
+}
+
+fn mark_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(&key, 5184000, 5184000);
 }
 
 // ---------------------------------------------------------------------------
