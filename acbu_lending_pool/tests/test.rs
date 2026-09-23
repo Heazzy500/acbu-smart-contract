@@ -722,3 +722,77 @@ fn test_borrow_without_lender_auth_fails() {
     assert_eq!(token_client.balance(&borrower), 0);
     assert!(client.get_loan(&borrower, &loan_id).is_none());
 }
+
+/// AC-015 (#738): repaid interest must be credited to the lender's tracked
+/// pool balance and remain in the contract as withdrawable liquidity — not
+/// transferred straight to the lender's wallet, which desynced
+/// `Balance - Borrowed` from the contract's actual token holdings.
+#[test]
+fn test_repay_credits_interest_to_lender_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+    let admin = Address::generate(&env);
+    let acbu_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let contract_id = env.register_contract(None, LendingPool);
+    let client = LendingPoolClient::new(&env, &contract_id);
+    let fee_rate_bps = 1_000i128; // 10% APR
+    client.initialize(&admin, &acbu_token, &fee_rate_bps);
+
+    let token_admin = StellarAssetClient::new(&env, &acbu_token);
+    let token_client = TokenClient::new(&env, &acbu_token);
+
+    let lender = Address::generate(&env);
+    let pool_liquidity = 1_000_000i128;
+    token_admin.mint(&lender, &pool_liquidity);
+    client.deposit(&lender, &pool_liquidity);
+
+    let borrower = Address::generate(&env);
+    let borrow_amount = 100_000i128;
+    let loan_id = 901u64;
+    client.borrow(&borrower, &lender, &borrow_amount, &loan_id);
+
+    // One year of accrual: 100_000 * 1_000 bps * 31_536_000 / (10_000 * 31_536_000) = 10_000.
+    env.ledger().with_mut(|l| l.timestamp += 31_536_000);
+
+    let loan = client
+        .get_loan(&borrower, &loan_id)
+        .expect("loan must exist");
+    let interest = loan.accrued_interest;
+    assert_eq!(
+        interest, 10_000,
+        "loan.accrued_interest should equal expected annual fee"
+    );
+
+    // Borrower repays principal + interest in full.
+    token_admin.mint(&borrower, &(borrow_amount + interest));
+    client.repay(&borrower, &(borrow_amount + interest), &loan_id);
+
+    // Interest stays in the pool and is credited to the lender's balance.
+    assert_eq!(
+        client.get_balance(&lender),
+        pool_liquidity + interest,
+        "client.get_balance(&lender) should include repaid interest"
+    );
+    // Lender's wallet is untouched (they deposited everything).
+    assert_eq!(token_client.balance(&lender), 0, "token_client.balance(&lender) should equal 0");
+    // Contract holds deposit + interest, matching Balance - Borrowed (Borrowed = 0).
+    assert_eq!(
+        token_client.balance(&contract_id),
+        pool_liquidity + interest,
+        "token_client.balance(&contract_id) should equal deposit + interest"
+    );
+
+    // The credited interest is withdrawable.
+    client.withdraw(&lender, &(pool_liquidity + interest));
+    assert_eq!(client.get_balance(&lender), 0, "client.get_balance(&lender) should equal 0");
+    assert_eq!(
+        token_client.balance(&lender),
+        pool_liquidity + interest,
+        "token_client.balance(&lender) should equal deposit + interest"
+    );
+}

@@ -43,6 +43,10 @@ pub enum OracleError {
     /// Emergency vote cast but consensus not yet reached — caller must wait for
     /// more validators to submit corroborating emergency rates.
     InsufficientEmergencyVotes = 7025,
+    /// AC-013 (#736): admin rate override deviates beyond the per-currency
+    /// emergency threshold — larger moves must go through `cast_emergency_vote`
+    /// + `update_rate` N-of-M validator consensus instead.
+    AdminDeviationTooLarge = 7026,
     Unknown = 7999,
 }
 
@@ -74,6 +78,7 @@ impl Display for OracleError {
             Self::RateNotInitialized => "rate not initialized - no submissions yet",
             Self::CurrencyNotRegistered => "currency not registered",
             Self::InsufficientEmergencyVotes => "emergency vote cast - waiting for N-of-M validator consensus",
+            Self::AdminDeviationTooLarge => "admin rate deviation exceeds emergency threshold",
             Self::Unknown => "unknown oracle error",
         };
         f.write_str(message)
@@ -532,49 +537,46 @@ impl OracleContract {
             env.panic_with_error(OracleError::UpdateIntervalNotMet);
         }
 
+        // AC-014 (#737): enforce the source-count quorum on every submission.
+        // The previous `sources.len() > 1` guard let 0- and 1-source payloads
+        // skip median aggregation and outlier rejection entirely, so a single
+        // bad feed (or the raw `rate` argument) could move the stored rate
+        // without meeting the multi-source quorum.
         let required = min_sigs.max(MIN_ORACLE_SOURCE_FEEDS);
-        // The 0/1-source path below intentionally bypasses median/outlier
-        // aggregation, so the multi-source quorum floor only applies once
-        // there's more than one source to aggregate.
-        if sources.len() > 1 && sources.len() < required {
+        if sources.len() < required {
             env.panic_with_error(OracleError::InsufficientOracleSources);
         }
 
-        // Bypass median and outlier calculation workflows if 0 or 1 submissions exist
-        let median_rate = if sources.is_empty() {
-            rate
-        } else if sources.len() == 1 {
-            sources.get(0).unwrap()
-        } else {
-            let raw_median = median(sources.clone()).unwrap_or(rate);
+        // Quorum above guarantees >= MIN_ORACLE_SOURCE_FEEDS submissions, so
+        // median/outlier aggregation always runs.
+        let raw_median = median(sources.clone()).unwrap_or(rate);
 
-            let mut clean_sources: Vec<i128> = Vec::new(&env);
-            for i in 0..sources.len() {
-                let source_rate = sources.get(i).unwrap();
-                let deviation_bps = calculate_deviation(source_rate, raw_median);
+        let mut clean_sources: Vec<i128> = Vec::new(&env);
+        for i in 0..sources.len() {
+            let source_rate = sources.get(i).unwrap();
+            let deviation_bps = calculate_deviation(source_rate, raw_median);
 
-                if deviation_bps > OUTLIER_THRESHOLD_BPS {
-                    let outlier_event = OutlierDetectionEvent {
-                        currency: currency.clone(),
-                        median_rate: raw_median,
-                        outlier_rate: source_rate,
-                        deviation_bps,
-                        timestamp: current_time,
-                    };
-                    env.events()
-                        .publish((symbol_short!("outlier"),), outlier_event);
-                } else {
-                    clean_sources.push_back(source_rate);
-                }
-            }
-
-            if clean_sources.is_empty() {
-                raw_median
-            } else if clean_sources.len() == 1 {
-                clean_sources.get(0).unwrap()
+            if deviation_bps > OUTLIER_THRESHOLD_BPS {
+                let outlier_event = OutlierDetectionEvent {
+                    currency: currency.clone(),
+                    median_rate: raw_median,
+                    outlier_rate: source_rate,
+                    deviation_bps,
+                    timestamp: current_time,
+                };
+                env.events()
+                    .publish((symbol_short!("outlier"),), outlier_event);
             } else {
-                median(clean_sources).unwrap_or(raw_median)
+                clean_sources.push_back(source_rate);
             }
+        }
+
+        let median_rate = if clean_sources.is_empty() {
+            raw_median
+        } else if clean_sources.len() == 1 {
+            clean_sources.get(0).unwrap()
+        } else {
+            median(clean_sources).unwrap_or(raw_median)
         };
 
         // ── Validator quorum (AC-003) ────────────────────────────────────────
@@ -808,10 +810,16 @@ impl OracleContract {
     }
 
     /// Admin override to set the rate for `currency` directly, bypassing validator
-    /// consensus, the update interval and outlier checks (admin only).
+    /// consensus and outlier checks (admin only).
     ///
-    /// Intended for emergencies. `rate` must be positive and may not roll the
-    /// timestamp backwards. Emits `RateUpdateEvent`.
+    /// Intended for emergencies. The first write for a currency (bootstrap) is
+    /// unrestricted, but once a rate exists the override is subject to the same
+    /// circuit-breaker rules as validator updates (AC-013 #736): the configured
+    /// update interval must have elapsed, and the new rate may not deviate from
+    /// the stored rate by more than the per-currency emergency threshold —
+    /// larger moves must go through [`Self::cast_emergency_vote`] +
+    /// [`Self::update_rate`] N-of-M consensus. `rate` must be positive and may
+    /// not roll the timestamp backwards. Emits `RateUpdateEvent`.
     pub fn set_rate_admin(env: Env, currency: CurrencyCode, rate: i128) {
         Self::check_admin(&env);
         if rate <= 0 {
@@ -823,6 +831,23 @@ impl OracleContract {
         if let Some(ref existing) = existing_rate {
             if current_time < existing.timestamp {
                 env.panic_with_error(OracleError::TimestampRollback);
+            }
+            // AC-013 (#736): without these gates a compromised admin could
+            // rewrite any rate at any time. Interval first (mirrors update_rate),
+            // then the emergency-deviation cap — beyond it, N-of-M emergency
+            // consensus is required instead of a unilateral admin write.
+            let update_interval: u64 = env
+                .storage()
+                .instance()
+                .get(&DATA_KEY.update_interval)
+                .unwrap_or(UPDATE_INTERVAL_SECONDS);
+            if current_time < existing.timestamp + update_interval {
+                env.panic_with_error(OracleError::UpdateIntervalNotMet);
+            }
+            let emergency_threshold = Self::get_emergency_threshold_bps(&env, &currency);
+            let deviation = calculate_deviation(rate, existing.rate_usd);
+            if deviation > emergency_threshold {
+                env.panic_with_error(OracleError::AdminDeviationTooLarge);
             }
         }
         let rate_data = RateData {

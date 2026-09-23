@@ -573,8 +573,12 @@ impl LendingPool {
     ///
     /// Requires `borrower`'s authorization and that the pool is not paused.
     /// `amount` is applied to accrued interest first, then principal, and may not
-    /// exceed the total amount due. When the principal reaches zero the loan is
-    /// marked [`LoanStatus::Repaid`]. Emits [`RepayEvent`], [`RepaymentEvent`]
+    /// exceed the total amount due. Repaid interest is credited to the lender's
+    /// tracked pool balance (AC-015 #738) — it stays in the contract as
+    /// withdrawable liquidity instead of being transferred to the lender's
+    /// wallet, keeping `Balance - Borrowed` in sync with the contract's token
+    /// holdings. When the principal reaches zero the loan is marked
+    /// [`LoanStatus::Repaid`]. Emits [`RepayEvent`], [`RepaymentEvent`]
     /// and [`LoanRepaidEvent`].
     pub fn repay(env: Env, borrower: Address, amount: i128, loan_id: u64) {
         // Re-entrancy guard
@@ -637,10 +641,29 @@ impl LendingPool {
 
         token.transfer(&borrower, &env.current_contract_address(), &amount);
 
+        // AC-015 (#738): credit repaid interest to the lender's tracked pool
+        // balance instead of transferring it straight to the lender's wallet.
+        // The tokens stay in the contract, so `Balance - Borrowed` continues to
+        // match actual holdings and the interest becomes withdrawable liquidity.
         let interest_repaid = amount - principal_repaid;
         if interest_repaid > 0 {
             let lender = loan_data.lender.clone();
-            token.transfer(&env.current_contract_address(), &lender, &interest_repaid);
+            let lender_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Balance(lender.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::Balance(lender.clone()),
+                &lender_balance
+                    .checked_add(interest_repaid)
+                    .unwrap_or_else(|| env.panic_with_error(Error::InvalidAmount)),
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Balance(lender.clone()),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_BUMP,
+            );
         }
 
         if loan_data.amount == 0 {

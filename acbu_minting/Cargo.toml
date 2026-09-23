@@ -14,6 +14,7 @@ shared = { path = "../shared" }
 [dev-dependencies]
 proptest = "1.11.0"
 soroban-sdk = { workspace = true, features = ['testutils'] }
+soroban-env-host = { workspace = true }
 serde_json = "1.0"
 
 [lints]

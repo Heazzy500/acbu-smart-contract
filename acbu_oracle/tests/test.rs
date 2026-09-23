@@ -457,9 +457,12 @@ fn test_update_rate_uses_even_source_median_average() {
     // Sorted = [980000, 1000000, 1020000, 1040000], median = (1000000 + 1020000) / 2
     assert_eq!(stored_rate, 1010000, "stored_rate should equal 1010000");
 }
-
 #[test]
-fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
+#[should_panic(expected = "#7009")]
+fn test_update_rate_rejects_empty_sources() {
+    // AC-014 (#737): the source-count quorum applies unconditionally — an
+    // empty submission can no longer store the raw `rate` argument without
+    // median/outlier aggregation.
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
@@ -472,6 +475,7 @@ fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut currencies = Vec::new(&env);
     currencies.push_back(ngn.clone());
+
     let mut basket_weights = Map::new(&env);
     basket_weights.set(ngn.clone(), 10000i128);
 
@@ -488,7 +492,6 @@ fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
         &sources,
         &env.ledger().timestamp(),
     );
-    assert_eq!(client.get_rate(&ngn), submitted_rate, "client.get_rate(&ngn) should equal submitted_rate");
 }
 
 // ─── Staleness tests ──────────────────────────────────────────────────────────
