@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # validate_json.sh – validate config JSON files against their schemas.
-# Requires: Node 20 LTS (see .nvmrc / .node-version)
+# Requires: Node 20 LTS (see .nvmrc)
 # Uses npx to run ajv-cli on-demand; no global install needed.
 # Usage: ./scripts/validate_json.sh
 
