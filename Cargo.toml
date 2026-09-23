@@ -34,6 +34,7 @@ resolver = "2"
 # Exact pin — caret (`^`) is intentionally *not* used here.
 # (Note: 21.0.0 was yanked from crates.io, using latest 21.x version)
 soroban-sdk = "=21.7.7"
+soroban-env-host = "=21.2.1"
 # Pin serde_with to version compatible with rustc 1.88.0
 serde_with = "=3.9.0"
 
