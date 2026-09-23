@@ -14,6 +14,9 @@
 //!  7. `set_min_signatures` updates the quorum and clears stale votes.
 //!  8. Normal (non-emergency) rate updates are unaffected.
 //!  9. Per-currency vote buckets are independent.
+//!
+//! Since AC-003 every rate commit — emergency or not — also needs
+//! `min_signatures` distinct validators to call `update_rate`.
 
 #![cfg(test)]
 
@@ -97,16 +100,31 @@ fn setup_with(
     (env, admin, validators, ngn, client)
 }
 
-/// Write an initial rate via a single validator source (no interval check needed
-/// for the first ever write).
-fn seed_rate(
+/// Have the first `min_signatures` validators each submit `rate`, which is
+/// exactly enough to commit a round (AC-003).
+fn submit_quorum(
     env: &Env,
     client: &OracleContractClient,
-    validator: &Address,
+    validators: &Vec<Address>,
     currency: &CurrencyCode,
     rate: i128,
 ) {
-    client.update_rate(validator, currency, &rate, &single_source(env, rate), &0u64);
+    for i in 0..client.get_min_signatures() {
+        let v = validators.get(i).unwrap();
+        client.update_rate(&v, currency, &rate, &single_source(env, rate), &0u64);
+    }
+}
+
+/// Write an initial rate with a full quorum (no interval check needed for the
+/// first ever write).
+fn seed_rate(
+    env: &Env,
+    client: &OracleContractClient,
+    validators: &Vec<Address>,
+    currency: &CurrencyCode,
+    rate: i128,
+) {
+    submit_quorum(env, client, validators, currency, rate);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +139,7 @@ fn test_single_validator_cannot_bypass_alone_no_votes() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     // 10% deviation but zero votes cast — should fall through to interval check.
@@ -136,7 +154,7 @@ fn test_one_vote_insufficient_for_bypass() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_100_000i128;
@@ -154,7 +172,7 @@ fn test_single_validator_can_bypass_with_min_1() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 1);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_100_000i128;
@@ -175,7 +193,7 @@ fn test_two_of_three_consensus_grants_bypass() {
     let v0 = validators.get(0).unwrap();
     let v1 = validators.get(1).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_200_000i128; // 20% deviation
@@ -186,8 +204,12 @@ fn test_two_of_three_consensus_grants_bypass() {
     client.cast_emergency_vote(&v1, &ngn, &emergency_rate);
     assert_eq!(client.get_emergency_vote_count(&ngn), 2u32, "should have 2 votes");
 
-    // Bypass granted — only one validator needs to call update_rate to commit.
+    // Bypass granted, but the rate still needs a 2-validator submission quorum.
     client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    assert_eq!(client.get_rate(&ngn), 1_000_000i128, "one submission must not commit");
+    assert_eq!(client.get_emergency_vote_count(&ngn), 2u32, "votes kept until commit");
+
+    client.update_rate(&v1, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 
     // After the bypass, votes are consumed.
@@ -202,7 +224,7 @@ fn test_three_of_five_consensus_grants_bypass() {
     let v1 = validators.get(1).unwrap();
     let v2 = validators.get(2).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_300_000i128; // 30% deviation
@@ -220,8 +242,8 @@ fn test_three_of_five_consensus_grants_bypass() {
 
     client.cast_emergency_vote(&v2, &ngn, &emergency_rate);
 
-    // 3 votes — bypass fires.
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    // 3 votes — bypass available; commits on the third submission.
+    submit_quorum(&env, &client, &validators, &ngn, emergency_rate);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 }
 
@@ -237,7 +259,7 @@ fn test_expired_votes_do_not_count() {
     let v0 = validators.get(0).unwrap();
     let v1 = validators.get(1).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_200_000i128;
@@ -267,7 +289,7 @@ fn test_duplicate_vote_does_not_increase_count() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_200_000i128;
@@ -317,7 +339,7 @@ fn test_stricter_threshold_blocks_6pct_deviation() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     client.set_emergency_threshold(&ngn, &1_000i128); // 10% threshold
     advance_time(&env, UPDATE_INTERVAL / 2);
 
@@ -334,7 +356,7 @@ fn test_permissive_threshold_needs_votes_for_3pct_deviation() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     client.set_emergency_threshold(&ngn, &200i128); // 2% threshold
     advance_time(&env, UPDATE_INTERVAL / 2);
 
@@ -350,7 +372,7 @@ fn test_permissive_threshold_2_votes_allow_3pct_bypass() {
     let v0 = validators.get(0).unwrap();
     let v1 = validators.get(1).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     client.set_emergency_threshold(&ngn, &200i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
@@ -358,7 +380,7 @@ fn test_permissive_threshold_2_votes_allow_3pct_bypass() {
     client.cast_emergency_vote(&v0, &ngn, &rate_3pct);
     client.cast_emergency_vote(&v1, &ngn, &rate_3pct);
 
-    client.update_rate(&v0, &ngn, &rate_3pct, &single_source(&env, rate_3pct), &0u64);
+    submit_quorum(&env, &client, &validators, &ngn, rate_3pct);
     assert_eq!(client.get_rate(&ngn), rate_3pct);
 }
 
@@ -374,7 +396,7 @@ fn test_set_min_signatures_clears_pending_votes() {
     let v0 = validators.get(0).unwrap();
     let v1 = validators.get(1).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emergency_rate = 1_200_000i128;
@@ -400,7 +422,7 @@ fn test_set_min_signatures_clears_pending_votes() {
 
     // v1 re-casts — now 2 votes, consensus with new quorum = 2.
     client.cast_emergency_vote(&v1, &ngn, &emergency_rate);
-    client.update_rate(&v0, &ngn, &emergency_rate, &single_source(&env, emergency_rate), &0u64);
+    submit_quorum(&env, &client, &validators, &ngn, emergency_rate);
     assert_eq!(client.get_rate(&ngn), emergency_rate);
 }
 
@@ -428,13 +450,12 @@ fn test_set_min_signatures_exceeds_count_panics() {
 #[test]
 fn test_normal_update_after_interval_succeeds() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
-    let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL + 1);
 
     let new_rate = 1_010_000i128; // 1% move
-    client.update_rate(&v0, &ngn, &new_rate, &single_source(&env, new_rate), &0u64);
+    submit_quorum(&env, &client, &validators, &ngn, new_rate);
     assert_eq!(client.get_rate(&ngn), new_rate);
 }
 
@@ -442,13 +463,12 @@ fn test_normal_update_after_interval_succeeds() {
 #[test]
 fn test_large_move_after_interval_is_normal() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
-    let v0 = validators.get(0).unwrap();
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL + 1);
 
     let new_rate = 1_200_000i128; // 20% move — interval already passed
-    client.update_rate(&v0, &ngn, &new_rate, &single_source(&env, new_rate), &0u64);
+    submit_quorum(&env, &client, &validators, &ngn, new_rate);
     assert_eq!(client.get_rate(&ngn), new_rate);
 }
 
@@ -457,7 +477,10 @@ fn test_large_move_after_interval_is_normal() {
 fn test_first_rate_write_never_blocked() {
     let (env, _admin, validators, ngn, client) = setup_with(3, 2);
     let v0 = validators.get(0).unwrap();
+    let v1 = validators.get(1).unwrap();
     client.update_rate(&v0, &ngn, &999_999i128, &single_source(&env, 999_999i128), &0u64);
+    assert!(client.try_get_rate(&ngn).is_err(), "one of two submissions must not commit");
+    client.update_rate(&v1, &ngn, &999_999i128, &single_source(&env, 999_999i128), &0u64);
     assert_eq!(client.get_rate(&ngn), 999_999i128);
 }
 
@@ -491,8 +514,8 @@ fn test_votes_are_independent_per_currency() {
     let client = OracleContractClient::new(&env, &contract_id);
     client.initialize(&admin, &validators, &2u32, &currencies, &weights);
 
-    seed_rate(&env, &client, &v0, &ngn, 1_000_000i128);
-    seed_rate(&env, &client, &v0, &kes, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &ngn, 1_000_000i128);
+    seed_rate(&env, &client, &validators, &kes, 1_000_000i128);
     advance_time(&env, UPDATE_INTERVAL / 2);
 
     let emrg = 1_200_000i128;
@@ -505,7 +528,7 @@ fn test_votes_are_independent_per_currency() {
     client.cast_emergency_vote(&v0, &kes, &emrg);
 
     // NGN has 2 votes → bypass available.
-    client.update_rate(&v0, &ngn, &emrg, &single_source(&env, emrg), &0u64);
+    submit_quorum(&env, &client, &validators, &ngn, emrg);
     assert_eq!(client.get_rate(&ngn), emrg, "NGN should be updated");
 
     // KES still has only 1 vote — bypass not yet available.
@@ -518,7 +541,7 @@ fn test_votes_are_independent_per_currency() {
 
     // Add second KES vote.
     client.cast_emergency_vote(&v1, &kes, &emrg);
-    client.update_rate(&v0, &kes, &emrg, &single_source(&env, emrg), &0u64);
+    submit_quorum(&env, &client, &validators, &kes, emrg);
     assert_eq!(client.get_rate(&kes), emrg, "KES should be updated");
 }
 
