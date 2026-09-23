@@ -338,6 +338,7 @@ impl MintingContract {
             .instance()
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let mut total_supply: i128 = env
             .storage()
             .instance()
@@ -360,6 +361,12 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .unwrap_or_else(|| env.panic_with_error(MintingError::InvalidMintAmount));
 
+        let fee_usd = calculate_fee(usdc_amount, fee_rate);
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         // Slippage guard: reject if computed output is below caller's minimum.
         if let Some(floor) = min_acbu_out {
             if acbu_amount < floor {
@@ -369,6 +376,7 @@ impl MintingContract {
 
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -380,7 +388,9 @@ impl MintingContract {
             env.panic_with_error(MintingError::InsufficientReserves);
         }
 
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -395,7 +405,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usdc_amount, fee_rate);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
 
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_usdc");
         let mint_event = MintEvent {
@@ -512,7 +526,9 @@ impl MintingContract {
             .expect("Overflow in usd total calculation");
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -632,6 +648,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -682,8 +699,15 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single);
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -696,7 +720,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -707,7 +733,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_single");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -775,6 +805,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -821,8 +852,15 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single);
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -835,7 +873,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -847,7 +887,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_demo");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -987,7 +1031,11 @@ impl MintingContract {
         // must count toward both the supply-cap/reserve projection and the
         // tracked total supply — otherwise `get_total_supply()` drifts below
         // the real circulating supply after every fee-bearing fiat mint.
-        let fee = calculate_fee(usd_gross, fee_rate);
+        let fee_usd = calculate_fee(usd_gross, fee_rate);
+        let fee = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
         let minted_total = acbu_amount
             .checked_add(fee)
             .expect("Overflow in minted amount calculation");
