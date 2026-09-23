@@ -1,15 +1,15 @@
 # Build artifacts
 /target/
 
-# Contract crates intentionally do not commit a lockfile. The Rust toolchain
-# and direct Soroban SDK dependency are pinned in source instead.
-Cargo.lock
+# Cargo.lock is committed for reproducible, MSRV-pinned builds (see
+# rust-toolchain.toml). Do not re-add it here.
 
-# WASM artifacts — binary blobs must not be committed to source control.
-# The sha256 hash is already pinned in contractimport! macros; obtain the
-# file locally by running:  ./scripts/fetch_token_wasm.sh
-soroban_token_contract.wasm
+# WASM build output — the vendored token contract is committed because
+# acbu_minting/acbu_burning/acbu_reserve_tracker import it at compile time
+# via contractimport!.  Its integrity is verified by build.rs (SHA-256).
+# Other WASM artifacts must not be committed.
 *.wasm
+!soroban_token_contract.wasm
 
 # Editor/IDE files
 .idea/
@@ -25,7 +25,6 @@ soroban_token_contract.wasm
 # OS files
 .DS_Store
 Thumbs.db
-target/
 **/*.rs.bk
 .soroban/
 .stellar/
@@ -36,3 +35,18 @@ test_snapshots/
 # surface and should not be committed to source control.
 /ISSUES.md
 /SECURITY_FIX_SUMMARY.md
+
+# Diagnostic / build dumps — never commit machine-specific artifacts
+error.txt
+error2.txt
+final.txt
+
+# Node tooling (not relevant to Rust repo)
+nodemon.json
+
+# Stray test files at repo root
+test_comprehensive.rs
+
+# Python
+__pycache__/
+*.pyc
