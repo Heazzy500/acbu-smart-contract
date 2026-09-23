@@ -21,7 +21,7 @@ mod mock_oracle {
     #[contractimpl]
     impl MockOracle {
         pub fn get_acbu_usd_rate(_env: Env) -> i128 {
-            100_000_000 // 1 USD (8 decimals)
+            shared::DECIMALS // 1 USD (7 decimals, same as the real oracle)
         }
 
         pub fn get_rate_with_timestamp(env: Env, currency: CurrencyCode) -> (i128, u64) {
@@ -188,7 +188,8 @@ fn test_is_reserve_sufficient_multiple_currencies_and_verify_from_token() {
     // supply 10 ACBU (10 * DECIMALS) → sufficient
     assert!(client.verify_reserves_manual(&(10 * DECIMALS)));
 
-    // supply 20 ACBU → insufficient
+    // supply 20 ACBU → insufficient (AC-002: a 10^8 divisor would value this
+    // at 2 USD and wrongly report sufficient)
     assert!(!client.verify_reserves_manual(&(20 * DECIMALS)));
 
     // verify_reserves reads MockToken which returns 10 * DECIMALS → sufficient

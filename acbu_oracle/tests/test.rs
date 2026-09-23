@@ -706,6 +706,50 @@ fn test_stale_basket_component_blocks_acbu_rate() {
     );
 }
 
+/// AC-001: get_acbu_usd_rate_with_timestamp (used by minting and burning) must
+/// return the same 7-decimal basket rate as get_acbu_usd_rate. It previously
+/// omitted the BASIS_POINTS rescale and under-reported the rate by 10,000x.
+#[test]
+fn test_acbu_rate_with_timestamp_matches_acbu_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+    let admin = Address::generate(&env);
+    let validator = Address::generate(&env);
+    let mut validators = Vec::new(&env);
+    validators.push_back(validator.clone());
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    let kes = CurrencyCode::new(&env, "KES");
+    let mut currencies = Vec::new(&env);
+    currencies.push_back(ngn.clone());
+    currencies.push_back(kes.clone());
+    let mut basket_weights = Map::new(&env);
+    basket_weights.set(ngn.clone(), 6_000i128); // 60%
+    basket_weights.set(kes.clone(), 4_000i128); // 40%
+
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &validators, &1u32, &currencies, &basket_weights);
+
+    let now = env.ledger().timestamp();
+    for (currency, rate) in [(ngn.clone(), 1_000_000i128), (kes.clone(), 2_000_000i128)] {
+        let mut sources = Vec::new(&env);
+        sources.push_back(rate);
+        sources.push_back(rate);
+        sources.push_back(rate);
+        client.update_rate(&validator, &currency, &rate, &sources, &now);
+    }
+
+    // 0.6 * 1_000_000 + 0.4 * 2_000_000 = 1_400_000 (7 decimals).
+    let expected = 1_400_000i128;
+    let (rate_ts, ts) = client.get_acbu_usd_rate_with_timestamp();
+    assert_eq!(rate_ts, expected, "basket rate with timestamp must be 7-decimal USD");
+    assert_eq!(client.get_acbu_usd_rate(), rate_ts, "both basket getters must agree");
+    assert_eq!(ts, now, "timestamp should be the oldest contributing rate timestamp");
+}
+
 /// Oracle must return RateNotInitialized error before any rate submissions.
 /// This prevents division by zero or 0-rate mints/burns before the first epoch.
 #[test]

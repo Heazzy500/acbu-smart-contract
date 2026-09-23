@@ -203,7 +203,11 @@ impl ReserveTrackerContract {
         let last_call: Option<u64> = env.storage().instance().get(&DATA_KEY.last_verify_call);
         if let Some(last) = last_call {
             if now.saturating_sub(last) < VERIFY_RESERVES_COOLDOWN_SECONDS {
-                return true;
+                if let Some(cached): Option<bool> =
+                    env.storage().instance().get(&DATA_KEY.last_verify_result)
+                {
+                    return cached;
+                }
             }
         }
 
@@ -333,10 +337,12 @@ impl ReserveTrackerContract {
             Vec::new(&env),
         );
 
+        // Supply and rate are both 7-decimal, so divide by DECIMALS once to get
+        // a 7-decimal USD value comparable to `value_usd` (AC-002).
         let total_acbu_usd = total_acbu_supply
             .checked_mul(acbu_usd_rate)
             .expect("Overflow in ACBU USD calculation")
-            .checked_div(100_000_000)
+            .checked_div(DECIMALS)
             .expect("Division by zero in ACBU USD calculation");
         if total_acbu_usd == 0 {
             return true;
