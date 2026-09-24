@@ -415,7 +415,7 @@ impl BurningContract {
             }
         }
 
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
@@ -522,7 +522,6 @@ impl BurningContract {
                 .publish((symbol_short!("burn"), user.clone()), burn_event);
         }
 
-        reentrancy_guard::release_guard(&env);
         amounts_out
     }
 

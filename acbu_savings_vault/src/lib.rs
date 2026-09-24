@@ -247,7 +247,7 @@ impl SavingsVault {
 
     /// Deposit (lock) ACBU for a term. User transfers ACBU to this contract.
     pub fn deposit(env: Env, user: Address, amount: i128, term_seconds: u64) -> i128 {
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         user.require_auth();
 
@@ -326,14 +326,13 @@ impl SavingsVault {
             },
         );
 
-        reentrancy_guard::release_guard(&env);
 
         net_amount
     }
 
     /// Withdraw unlocked ACBU + yield for a specific term.
     pub fn withdraw(env: Env, user: Address, term_seconds: u64, amount: i128) -> i128 {
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         user.require_auth();
 
@@ -445,7 +444,6 @@ impl SavingsVault {
             (user, amount, 0i128, yield_amount, now),
         );
 
-        reentrancy_guard::release_guard(&env);
 
         payout_amount
     }

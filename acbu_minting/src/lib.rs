@@ -316,7 +316,7 @@ impl MintingContract {
         min_acbu_out: Option<i128>,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -438,7 +438,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -453,7 +452,7 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -618,7 +617,6 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -634,7 +632,7 @@ impl MintingContract {
         s_token_amount: i128,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -768,7 +766,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -785,7 +782,7 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
@@ -927,7 +924,6 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -944,7 +940,7 @@ impl MintingContract {
         fintech_tx_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
@@ -1098,7 +1094,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -1155,7 +1150,6 @@ impl MintingContract {
         }
         token.transfer(&custody, &recipient, &amount);
 
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Return the operator address (the key authorized to sign day-to-day mint
