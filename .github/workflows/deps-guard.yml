@@ -1,9 +1,9 @@
 name: Dependency Supply-Chain Guard
 
-# W2-Z-020: Git dependencies (SDK + verifier lib) must not be pulled straight
-# from GitHub. Every dependency has to resolve from a registry with a checksum
-# recorded in the committed Cargo.lock, so a build never depends on live GitHub
-# availability or the state of a third-party fork.
+# W2-Z-020 / AZ-005: Git dependencies must not be pulled from a floating
+# branch or tag — every git dep must be pinned to an exact commit via `rev`.
+# Prefer registry sources (crates.io) with checksums recorded in Cargo.lock
+# so that builds are fully reproducible without live GitHub access.
 
 on:
   push:
@@ -30,6 +30,55 @@ jobs:
             exit 1
           fi
           echo "No git dependencies declared."
+
+      # AZ-005: Even when a git dep is technically present, a floating branch
+      # or tag (no `rev`) means the source can silently change between builds,
+      # breaking reproducibility and opening a supply-chain attack surface.
+      # Reject any git dep that lacks a `rev = "<commit-sha>"` field.
+      - name: Fail on git dependencies without a pinned `rev`
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' manifest; do
+            # Collect all [dependencies.*] blocks that use `git =` but have no `rev`.
+            # A well-formed pinned dep looks like:
+            #   some-crate = { git = "https://...", rev = "abc1234" }
+            # A floating dep (branch/tag only, or bare git) lacks `rev =`.
+            python3 - "$manifest" <<'PYEOF'
+          import sys, re, pathlib
+
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text()
+
+          # Find every value that contains git = "..." but NOT rev = "..."
+          # within the same dep entry (single-line or inline-table form).
+          # This catches:
+          #   foo = { git = "...", branch = "main" }   ← no rev → BAD
+          #   foo = { git = "...", tag = "v1.0" }      ← no rev → BAD
+          #   foo = { git = "...", rev = "abc1234" }   ← has rev → OK
+          pattern = re.compile(
+              r'\{[^}]*\bgit\s*=\s*"[^"]*"[^}]*\}',
+          )
+          bad = []
+          for m in pattern.finditer(text):
+              block = m.group(0)
+              if 'rev' not in block:
+                  # Find the dep name by looking backwards for the key
+                  before = text[:m.start()]
+                  name_match = re.search(r'(\S+)\s*=\s*$', before.rstrip())
+                  dep_name = name_match.group(1) if name_match else '<unknown>'
+                  bad.append((dep_name, block.strip()))
+
+          if bad:
+              for name, block in bad:
+                  print(f"::error file={path}::AZ-005: git dep '{name}' is missing `rev`; "
+                        f"floating branch/tag is not reproducible. Add rev = \"<commit-sha>\". "
+                        f"Block: {block}")
+              sys.exit(1)
+          PYEOF
+          done < <(find . -name 'Cargo.toml' -print0)
+          echo "All git dependencies (if any) have a pinned rev."
 
       - name: Fail on git sources recorded in Cargo.lock
         shell: bash
