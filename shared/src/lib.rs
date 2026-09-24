@@ -303,6 +303,14 @@ pub enum ContractError {
     /// cause unacceptable slippage for this transaction.
     SlippageExceeded = 13,
 
+    /// The credential commitment was already attested by the KYC authority
+    /// (zk_verifier trusted commitment registry, AZ-002).
+    CommitmentAlreadyAttested = 14,
+    /// The credential commitment submitted with a proof was never attested by
+    /// the trusted KYC authority (zk_verifier trusted commitment registry,
+    /// AZ-002).
+    CommitmentNotAttested = 15,
+
     Unknown = 9999,
 }
 
@@ -322,6 +330,8 @@ impl core::fmt::Display for ContractError {
             ContractError::InvalidRecipient => write!(f, "invalid recipient"),
             ContractError::InvalidVersion => write!(f, "invalid version"),
             ContractError::SlippageExceeded => write!(f, "output below minimum: slippage exceeded"),
+            ContractError::CommitmentAlreadyAttested => write!(f, "commitment already attested"),
+            ContractError::CommitmentNotAttested => write!(f, "commitment not attested by the KYC authority"),
             ContractError::Unknown => write!(f, "unknown error"),
         }
     }

@@ -18,6 +18,7 @@
 //! ```text
 //! DataKey::Nullifier(BytesN<32>)  →  bool      (ledger-TTL-bumped on each verify)
 //! DataKey::Verified(Address)      →  bool      (ledger-TTL-bumped on each verify)
+//! DataKey::AttestedCommitment(BytesN<32>) → bool (ledger-TTL-bumped on register)
 //! DataKey::Admin                  →  Address   (instance — single scalar, bounded)
 //! DataKey::Paused                 →  bool      (instance — single scalar, bounded)
 //! ```
@@ -74,6 +75,12 @@ pub enum DataKey {
     ///
     /// Stored in *persistent* storage for the same reason as `Nullifier`.
     Verified(Address),
+    /// Attested credential commitment — keyed per 32-byte commitment.
+    ///
+    /// AZ-002: commitments recorded by the trusted KYC authority (the
+    /// admin). Stored in *persistent* storage like `Nullifier`/`Verified`
+    /// so the registry stays bounded.
+    AttestedCommitment(BytesN<32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -100,8 +107,64 @@ impl ZkVerifier {
 
     // ── Proof verification ──────────────────────────────────────────────────
 
+    /// AZ-002 — trusted commitment registry.
+    ///
+    /// The admin acts as the trusted KYC authority: after a user's redacted
+    /// KYC review is approved, it records the user's credential commitment
+    /// `poseidon2(kyc_level, country_code, salt)` — derived from the
+    /// authority's **own** verified records, never from user-claimed values.
+    ///
+    /// Only attested commitments are accepted by `verify`, so an unverified
+    /// user can no longer claim an arbitrary `kyc_level` and produce a valid
+    /// proof about a self-asserted credential.
+    pub fn register_commitment(env: Env, commitment: BytesN<32>) {
+        // The KYC authority (admin) is the only party allowed to attest.
+        Self::check_admin(&env);
+        Self::assert_not_paused(&env);
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AttestedCommitment(commitment.clone()))
+        {
+            panic_with_error!(&env, ContractError::CommitmentAlreadyAttested);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttestedCommitment(commitment.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AttestedCommitment(commitment.clone()),
+            NULLIFIER_TTL_THRESHOLD,
+            NULLIFIER_TTL_LEDGERS,
+        );
+
+        env.events().publish(
+            (symbol_short!("attested"), commitment.clone()),
+            (),
+        );
+
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Returns `true` if `commitment` was attested by the trusted KYC
+    /// authority.
+    pub fn is_attested(env: Env, commitment: BytesN<32>) -> bool {
+        let key = DataKey::AttestedCommitment(commitment);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                NULLIFIER_TTL_THRESHOLD,
+                NULLIFIER_TTL_LEDGERS,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record a successful proof verification for `wallet` with the given
-    /// `nullifier`.
+    /// `nullifier` and credential `commitment`.
     ///
     /// # AZ-014
     ///
@@ -117,9 +180,26 @@ impl ZkVerifier {
     ///   with valid (or forged) verifications.
     /// * Instance storage remains a small, fixed-size scalar set that does
     ///   not grow at runtime.
-    pub fn verify(env: Env, wallet: Address, nullifier: BytesN<32>) {
+    ///
+    /// # AZ-002
+    ///
+    /// The credential `commitment` submitted with the proof must have been
+    /// attested by the trusted KYC authority first. Proofs about commitments
+    /// that were never attested are rejected — the proof would otherwise be
+    /// vacuous (knowledge of *some* preimage for a self-chosen commitment).
+    pub fn verify(env: Env, wallet: Address, nullifier: BytesN<32>, commitment: BytesN<32>) {
         wallet.require_auth();
         Self::assert_not_paused(&env);
+
+        // AZ-002 — reject proofs whose commitment was never attested by the
+        // trusted KYC authority.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::AttestedCommitment(commitment.clone()))
+        {
+            panic_with_error!(&env, ContractError::CommitmentNotAttested);
+        }
 
         // Reject replayed nullifiers.
         if env
