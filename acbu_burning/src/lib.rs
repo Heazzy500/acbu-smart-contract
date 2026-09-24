@@ -10,7 +10,7 @@ use shared::{
     ContractPhase, CurrencyCode, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION,
     DECIMALS, MIN_BURN_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS, ORACLE_GET_BASKET_WEIGHT,
     ORACLE_GET_CURRENCIES, ORACLE_GET_RATE_WITH_TS, ORACLE_GET_S_TOKEN_ADDR,
-    RESERVE_IS_SUFFICIENT, TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
+    MINTING_RECORD_BURN, RESERVE_IS_SUFFICIENT, TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
 };
 
 #[contracttype]
@@ -31,6 +31,9 @@ pub struct DataKey {
     /// `Vec<Address>` of circuit-breaker peers (minting, reserve tracker, …) whose
     /// pause also halts redemption (AC-030).
     pub circuit_peers: Symbol,
+    /// Minting contract notified of every burn so its supply tracker stays
+    /// in step with the token (AC-005).
+    pub minting_contract: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -47,6 +50,7 @@ const DATA_KEY: DataKey = DataKey {
     pending_admin: symbol_short!("PEND_ADM"),
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
     circuit_peers: symbol_short!("CB_PEERS"),
+    minting_contract: symbol_short!("MINTING"),
 };
 
 
@@ -79,6 +83,7 @@ impl BurningContract {
     /// Sets up all required addresses and fee parameters. Panics if called a
     /// second time (`admin` key already exists) or if either fee rate is
     /// outside [0, BASIS_POINTS].
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -222,10 +227,13 @@ impl BurningContract {
             }
         }
 
+        // AC-008: same guard as redeem_basket around the value-moving calls.
+        reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
         acbu_client.burn(&user, &acbu_amount);
+        Self::notify_minting_burn(&env, acbu_amount);
 
         let token = soroban_sdk::token::Client::new(&env, &stoken);
         let spender = env.current_contract_address();
@@ -246,7 +254,7 @@ impl BurningContract {
         env.events()
             .publish((symbol_short!("burn"), user), burn_event);
 
-
+        reentrancy_guard::release_guard(&env);
         stoken_out
     }
 
@@ -415,11 +423,12 @@ impl BurningContract {
             }
         }
 
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
         acbu_client.burn(&user, &acbu_amount);
+        Self::notify_minting_burn(&env, acbu_amount);
 
         let mut last_positive_weight_index: Option<u32> = None;
         for i in 0..weights.len() {
@@ -522,7 +531,6 @@ impl BurningContract {
                 .publish((symbol_short!("burn"), user.clone()), burn_event);
         }
 
-        reentrancy_guard::release_guard(&env);
         amounts_out
     }
 
@@ -663,6 +671,24 @@ impl BurningContract {
         env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
         env.events()
             .publish((symbol_short!("cb_peers"),), peers);
+    }
+
+    /// Link the minting contract whose supply tracker is decremented on every
+    /// burn (admin only, AC-005). The minting side must link this contract via
+    /// its `set_burning_contract` for the notification to be accepted.
+    pub fn set_minting_contract(env: Env, minting_contract: Address) {
+        Self::check_admin(&env);
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.minting_contract, &minting_contract);
+        env.events()
+            .publish((symbol_short!("mint_ctr"),), minting_contract);
+    }
+
+    /// Return the linked minting contract, if any.
+    pub fn get_minting_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DATA_KEY.minting_contract)
     }
 
     /// Return the linked circuit-breaker peers (empty if none).
@@ -820,6 +846,19 @@ impl BurningContract {
         );
         if !reserve_ok {
             env.panic_with_error(ContractError::InsufficientReserves);
+        }
+    }
+
+    /// Report a burn to the linked minting contract so its tracked supply is
+    /// decremented (AC-005). No-op while no minting contract is linked.
+    fn notify_minting_burn(env: &Env, acbu_amount: i128) {
+        let minting: Option<Address> = env.storage().instance().get(&DATA_KEY.minting_contract);
+        if let Some(minting) = minting {
+            env.invoke_contract::<()>(
+                &minting,
+                &Symbol::new(env, MINTING_RECORD_BURN),
+                vec![env, acbu_amount.into_val(env)],
+            );
         }
     }
 

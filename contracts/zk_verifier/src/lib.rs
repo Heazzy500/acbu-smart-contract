@@ -33,7 +33,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env,
+    BytesN, Env, Vec,
 };
 use shared::ContractError;
 
@@ -55,6 +55,9 @@ const NULLIFIER_TTL_THRESHOLD: u32 = NULLIFIER_TTL_LEDGERS / 2;
 /// TTL for the instance storage (admin + paused flag).
 const INSTANCE_TTL_LEDGERS: u32 = 5_256_000; // ~1 year
 
+/// Maximum expected length for public inputs slice.
+const MAX_PUBLIC_INPUTS_LEN: u32 = 5;
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -66,11 +69,11 @@ pub enum DataKey {
     Admin,
     /// Whether the contract is paused.
     Paused,
-    /// Spent nullifier — keyed per 32-byte nullifier hash.
+    /// Spent nullifier — keyed per (commitment, nullifier) pair.
     ///
     /// Stored in *persistent* storage so entries expire individually via TTL
     /// rather than accumulating in a single unbounded instance `Map`.
-    Nullifier(BytesN<32>),
+    ScopedNullifier(BytesN<32>, BytesN<32>),
     /// Verified wallet — keyed per address.
     ///
     /// Stored in *persistent* storage for the same reason as `Nullifier`.
@@ -187,9 +190,23 @@ impl ZkVerifier {
     /// attested by the trusted KYC authority first. Proofs about commitments
     /// that were never attested are rejected — the proof would otherwise be
     /// vacuous (knowledge of *some* preimage for a self-chosen commitment).
-    pub fn verify(env: Env, wallet: Address, nullifier: BytesN<32>, commitment: BytesN<32>) {
+    pub fn verify(
+        env: Env,
+        wallet: Address,
+        nullifier: BytesN<32>,
+        commitment: BytesN<32>,
+        public_inputs: Vec<u128>,
+    ) {
         wallet.require_auth();
         Self::assert_not_paused(&env);
+
+        // AZ-007: Enforce bound on public_inputs length to prevent resource abuse.
+        // This check assumes `public_inputs` are passed directly to the contract.
+        // If they are part of a larger proof structure, this check would need to be
+        // integrated at the point where they are deserialized or used.
+        if public_inputs.len() != MAX_PUBLIC_INPUTS_LEN {
+            panic_with_error!(&env, ContractError::InvalidPublicInputsLength);
+        }
 
         // AZ-002 — reject proofs whose commitment was never attested by the
         // trusted KYC authority.
@@ -201,22 +218,22 @@ impl ZkVerifier {
             panic_with_error!(&env, ContractError::CommitmentNotAttested);
         }
 
-        // Reject replayed nullifiers.
+        // Reject replayed nullifiers for this commitment.
         if env
             .storage()
             .persistent()
-            .has(&DataKey::Nullifier(nullifier.clone()))
+            .has(&DataKey::ScopedNullifier(commitment.clone(), nullifier.clone()))
         {
-            panic_with_error!(&env, ContractError::Unauthorized);
+            panic_with_error!(&env, ContractError::NullifierAlreadySpent);
         }
 
         // Record the nullifier.  TTL is set here; it will be bumped on every
         // subsequent `is_verified` check so active entries stay alive.
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(nullifier.clone()), &true);
+            .set(&DataKey::ScopedNullifier(commitment.clone(), nullifier.clone()), &true);
         env.storage().persistent().extend_ttl(
-            &DataKey::Nullifier(nullifier.clone()),
+            &DataKey::ScopedNullifier(commitment.clone(), nullifier.clone()),
             NULLIFIER_TTL_THRESHOLD,
             NULLIFIER_TTL_LEDGERS,
         );
@@ -257,11 +274,11 @@ impl ZkVerifier {
         }
     }
 
-    /// Returns `true` if `nullifier` has already been spent.
-    pub fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+    /// Returns `true` if `nullifier` has already been spent for `commitment`.
+    pub fn is_nullifier_spent(env: Env, commitment: BytesN<32>, nullifier: BytesN<32>) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::Nullifier(nullifier))
+            .has(&DataKey::ScopedNullifier(commitment, nullifier))
     }
 
     // ── Admin ───────────────────────────────────────────────────────────────

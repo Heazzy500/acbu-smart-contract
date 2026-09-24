@@ -55,7 +55,7 @@ pub struct AdminProposal {
 
 /// Multisig configuration stored inside the multisig contract.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultisigConfig {
     /// Ordered list of authorised signers.
     pub signers: Vec<Address>,
@@ -340,12 +340,8 @@ impl core::fmt::Display for ContractError {
             ContractError::SlippageExceeded => write!(f, "output below minimum: slippage exceeded"),
             ContractError::ArithmeticOverflow => write!(f, "arithmetic overflow"),
             ContractError::InvalidCircuitPeer => write!(f, "invalid circuit-breaker peer"),
-            ContractError::CommitmentAlreadyAttested => {
-                write!(f, "credential commitment already attested by KYC authority")
-            }
-            ContractError::CommitmentNotAttested => {
-                write!(f, "credential commitment was not attested by trusted KYC authority")
-            }
+            ContractError::CommitmentAlreadyAttested => write!(f, "commitment already attested"),
+            ContractError::CommitmentNotAttested => write!(f, "commitment not attested"),
             ContractError::Unknown => write!(f, "unknown error"),
         }
     }
@@ -391,6 +387,9 @@ pub const RESERVE_IS_SUFFICIENT: &str = "is_reserve_sufficient";
 /// It must only read local state — peers call it on each other.
 pub const CIRCUIT_IS_PAUSED: &str = "is_paused";
 pub const TOKEN_GET_TOTAL_SUPPLY: &str = "get_total_supply";
+/// Burn notification the burning contract sends the minting contract after every
+/// ACBU burn so the minting supply tracker stays in step with the token (AC-005).
+pub const MINTING_RECORD_BURN: &str = "record_burn";
 
 /// Constants
 pub const BASIS_POINTS: i128 = 10_000;

@@ -320,14 +320,9 @@ fn test_borrow_emits_event() {
         .rev()
         .find(|e| {
             e.0 == contract_id
-                && e.1.first().map_or(false, |t| {
-                    if let Ok(symbol_val) =
-                        TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
-                    {
-                        symbol_val == symbol_short!("borrow")
-                    } else {
-                        false
-                    }
+                && e.1.first().is_some_and(|t| {
+                    TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
+                        .is_ok_and(|s| s == symbol_short!("borrow"))
                 })
         })
         .expect("borrow event not found");
@@ -489,14 +484,9 @@ fn test_repay_emits_event() {
         .rev()
         .find(|e| {
             e.0 == contract_id
-                && e.1.first().map_or(false, |t| {
-                    if let Ok(symbol_val) =
-                        TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
-                    {
-                        symbol_val == symbol_short!("repay")
-                    } else {
-                        false
-                    }
+                && e.1.first().is_some_and(|t| {
+                    TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
+                        .is_ok_and(|s| s == symbol_short!("repay"))
                 })
         })
         .expect("repay event not found");
@@ -724,14 +714,9 @@ fn test_loan_created_event_has_correct_term_seconds() {
         .rev()
         .find(|e| {
             e.0 == contract_id
-                && e.1.first().map_or(false, |t| {
-                    if let Ok(symbol_val) =
-                        TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
-                    {
-                        symbol_val == symbol_short!("loan_cr")
-                    } else {
-                        false
-                    }
+                && e.1.first().is_some_and(|t| {
+                    TryIntoVal::<_, Symbol>::try_into_val(&t, &env)
+                        .is_ok_and(|s| s == symbol_short!("loan_cr"))
                 })
         })
         .expect("loan_cr event not found");
@@ -789,7 +774,7 @@ fn test_withdraw_leaving_exactly_one_stroop_fails() {
 /// Positive test: Full withdrawal (balance becomes exactly 0) succeeds and storage entry is cleaned up.
 #[test]
 fn test_withdraw_full_balance_removes_storage_entry() {
-    let (env, client, contract_id, _admin, acbu_token) = setup();
+    let (env, client, _contract_id, _admin, acbu_token) = setup();
 
     let lender = Address::generate(&env);
     let amount = 100 * DECIMALS;
@@ -843,7 +828,7 @@ fn test_withdraw_leaving_exactly_minimum_balance_succeeds() {
 
     let lender = Address::generate(&env);
     // Deposit 100.1 ACBU (100_100_000 stroops) so we can withdraw to exactly MIN_POOL_BALANCE (1_000_000)
-    let amount = 100_100_000i128; // In stroops
+    let _amount = 100_100_000i128; // In stroops
     
     let token_admin = StellarAssetClient::new(&env, &acbu_token);
     // Use mint with exact stroop amount (avoiding DECIMALS which is 10_000_000_000 for 7-decimal token)

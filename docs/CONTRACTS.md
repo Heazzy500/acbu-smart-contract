@@ -140,8 +140,9 @@ Provides multi-signature authorization for administrative actions.
 - `initialize`: Set up signers and threshold
 - `propose`: Create new proposal
 - `approve`: Approve proposal (signer function)
-- `execute`: Execute approved proposal
-- `add_signer/remove_signer`: Manage signers
+- `execute`: Execute approved proposal (applies any bound governance action)
+- `propose_update_config`: Propose a new signer set and threshold
+- `propose_upgrade`: Propose a WASM upgrade of the multisig itself
 
 ### Security
 
