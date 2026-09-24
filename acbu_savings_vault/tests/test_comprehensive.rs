@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use acbu_savings_vault::{SavingsVault, SavingsVaultClient, WithdrawEvent, DepositEvent};
-use shared::{BASIS_POINTS, DECIMALS};
+use shared::BASIS_POINTS;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
@@ -73,8 +73,12 @@ impl TestEnv {
         self.token_admin().mint(&self.user2, &amount);
     }
 
-    fn mint_to_vault(&self, amount: i128) {
-        self.token_admin().mint(&self.contract_id, &amount);
+    /// Fund the vault's yield reserve (AC-007: the only source of yield).
+    fn fund_yield(&self, amount: i128) {
+        if amount > 0 {
+            self.token_admin().mint(&self.admin, &amount);
+            self.client.fund_yield_reserve(&self.admin, &amount);
+        }
     }
 
     fn advance_time(&self, delta: u64) {
@@ -725,7 +729,7 @@ fn test_yield_accrues_after_term_only() {
     // After term - yield should accrue
     h.advance_time(term);
     let exp_yield = expected_yield(amount, yield_rate, term);
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
 
     assert_eq!(h.client.get_pending_yield(&h.user, &term), exp_yield, "h.client.get_pending_yield(&h.user, &term) should equal exp_yield");
 }
@@ -745,7 +749,7 @@ fn test_yield_30_days_at_10_percent_apr() {
     let elapsed = h.now() - deposit_ts;
 
     let exp_yield = expected_yield(amount, yield_rate, elapsed);
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
 
     assert_eq!(h.client.get_pending_yield(&h.user, &term), exp_yield, "h.client.get_pending_yield(&h.user, &term) should equal exp_yield");
 
@@ -769,7 +773,7 @@ fn test_yield_one_year_at_10_percent_apr() {
     let exp_yield = expected_yield(amount, yield_rate, elapsed);
     assert_eq!(exp_yield, 1_000_000i128, "10% of 10M should be 1M");
 
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
     h.client.withdraw(&h.user, &SECONDS_PER_YEAR, &amount);
     assert_eq!(h.user_balance(), amount + 1_000_000, "h.user_balance() should equal amount + 1_000_000");
 }
@@ -791,7 +795,7 @@ fn test_yield_six_months_at_10_percent_apr() {
     let exp_yield = expected_yield(amount, yield_rate, elapsed);
     assert_eq!(exp_yield, 500_000i128, "5% of 10M should be 500k");
 
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
     h.client.withdraw(&h.user, &six_months, &amount);
     assert_eq!(h.user_balance(), amount + 500_000, "h.user_balance() should equal amount + 500_000");
 }
@@ -833,7 +837,7 @@ fn test_yield_on_net_deposit_after_fee() {
 
     // Yield is calculated on net, not gross
     let exp_yield = expected_yield(net, yield_rate, elapsed);
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
 
     h.client.withdraw(&h.user, &term, &net);
     assert_eq!(h.user_balance(), net + exp_yield, "h.user_balance() should equal net + exp_yield");
@@ -862,7 +866,7 @@ fn test_yield_proportional_to_elapsed_time() {
         "Yield should be approximately 2.5% of principal"
     );
 
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
     h.client.withdraw(&h.user, &term, &amount);
 }
 
@@ -881,7 +885,7 @@ fn test_yield_low_rate_5_percent_annual() {
     let exp_yield = expected_yield(amount, yield_rate, SECONDS_PER_YEAR);
     assert_eq!(exp_yield, 5_000_000i128, "5% of 100M should be 5M");
 
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
     h.client.withdraw(&h.user, &term, &amount);
     assert_eq!(h.user_balance(), amount + exp_yield, "h.user_balance() should equal amount + exp_yield");
 }
@@ -901,7 +905,7 @@ fn test_yield_high_rate_20_percent_annual() {
     let exp_yield = expected_yield(amount, yield_rate, SECONDS_PER_YEAR);
     assert_eq!(exp_yield, 2_000_000i128, "20% of 10M should be 2M");
 
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
     h.client.withdraw(&h.user, &term, &amount);
     assert_eq!(h.user_balance(), amount + exp_yield, "h.user_balance() should equal amount + exp_yield");
 }
@@ -921,7 +925,7 @@ fn test_yield_event_carries_correct_yield_amount() {
     let elapsed = h.now() - deposit_ts;
 
     let exp_yield = expected_yield(amount, yield_rate, elapsed);
-    h.mint_to_vault(exp_yield);
+    h.fund_yield(exp_yield);
 
     h.client.withdraw(&h.user, &term, &amount);
 
@@ -951,7 +955,7 @@ fn test_two_users_independent_deposits_and_yields() {
     let elapsed = h.now() - deposit_ts;
 
     let exp_yield = expected_yield(amount, yield_rate, elapsed);
-    h.mint_to_vault(exp_yield * 2);
+    h.fund_yield(exp_yield * 2);
 
     h.client.withdraw(&h.user, &term, &amount);
     h.client.withdraw(&h.user2, &term, &amount);
@@ -1034,7 +1038,7 @@ fn test_partial_yield_when_withdrawing_before_all_lots_mature() {
     let elapsed1 = h.now() - ts1;
     let exp_yield1 = expected_yield(amount, yield_rate, elapsed1);
 
-    h.mint_to_vault(exp_yield1);
+    h.fund_yield(exp_yield1);
 
     // Withdraw the first amount which accrued yield
     h.client.withdraw(&h.user, &term, &amount);
@@ -1125,7 +1129,7 @@ fn test_precision_with_various_combinations() {
         let elapsed = h.now() - deposit_ts;
 
         let exp_yield = expected_yield(actual_deposit, yield_rate, elapsed);
-        h.mint_to_vault(exp_yield);
+        h.fund_yield(exp_yield);
 
         h.client.withdraw(&h.user, &term, &actual_deposit);
 
@@ -1152,7 +1156,7 @@ fn test_yield_continues_accruing_after_term_maturity() {
     // Advance to term maturity
     h.advance_time(term);
     let yield_at_maturity = expected_yield(amount, yield_rate, term);
-    h.mint_to_vault(yield_at_maturity);
+    h.fund_yield(yield_at_maturity);
 
     assert_eq!(h.client.get_pending_yield(&h.user, &term), yield_at_maturity, "h.client.get_pending_yield(&h.user, &term) should equal yield_at_maturity");
 
@@ -1161,7 +1165,7 @@ fn test_yield_continues_accruing_after_term_maturity() {
     let total_elapsed = h.now() - deposit_ts;
     let total_yield = expected_yield(amount, yield_rate, total_elapsed);
     let additional_yield = total_yield - yield_at_maturity;
-    h.mint_to_vault(additional_yield);
+    h.fund_yield(additional_yield);
 
     assert_eq!(h.client.get_pending_yield(&h.user, &term), total_yield, "Yield should continue accruing after maturity");
 
@@ -1192,7 +1196,7 @@ fn test_multiple_users_different_terms_isolated() {
     h.set_time(deposit_ts1 + term1 + 1);
     let elapsed1 = h.now() - deposit_ts1;
     let yield1 = expected_yield(amount1, yield_rate, elapsed1);
-    h.mint_to_vault(yield1);
+    h.fund_yield(yield1);
 
     h.client.withdraw(&h.user, &term1, &amount1);
     assert_eq!(h.user_balance(), amount1 + yield1, "h.user_balance() should equal amount1 + yield1");
@@ -1205,7 +1209,7 @@ fn test_multiple_users_different_terms_isolated() {
     h.set_time(deposit_ts2 + term2 + 1);
     let elapsed2 = h.now() - deposit_ts2;
     let yield2 = expected_yield(amount2, yield_rate, elapsed2);
-    h.mint_to_vault(yield2);
+    h.fund_yield(yield2);
 
     h.client.withdraw(&h.user2, &term2, &amount2);
     assert_eq!(h.user2_balance(), amount2 + yield2, "h.user2_balance() should equal amount2 + yield2");
@@ -1232,7 +1236,7 @@ fn test_fee_and_yield_with_multiple_partial_withdrawals() {
     h.advance_time(term);
     let elapsed = h.now() - deposit_ts;
     let total_yield = expected_yield(net, yield_rate, elapsed);
-    h.mint_to_vault(total_yield);
+    h.fund_yield(total_yield);
 
     // Partial withdrawal 1: 25%
     let withdraw1 = net / 4;
@@ -1309,7 +1313,7 @@ fn test_concurrent_deposits_and_withdrawals_multiple_terms() {
     h.set_time(deposit_ts + short_term + 1);
     let elapsed_short = h.now() - deposit_ts;
     let yield_short = expected_yield(amount_short, yield_rate, elapsed_short);
-    h.mint_to_vault(yield_short);
+    h.fund_yield(yield_short);
 
     h.client.withdraw(&h.user, &short_term, &amount_short);
     assert_eq!(h.user_balance(), amount_short + yield_short, "h.user_balance() should equal amount_short + yield_short");
@@ -1322,7 +1326,7 @@ fn test_concurrent_deposits_and_withdrawals_multiple_terms() {
     h.set_time(deposit_ts + medium_term + 1);
     let elapsed_medium = h.now() - deposit_ts;
     let yield_medium = expected_yield(amount_medium, yield_rate, elapsed_medium);
-    h.mint_to_vault(yield_medium);
+    h.fund_yield(yield_medium);
 
     h.client.withdraw(&h.user, &medium_term, &amount_medium);
     assert_eq!(h.user_balance(), amount_short + yield_short + amount_medium + yield_medium, "h.user_balance() should equal amount_short + yield_short + amount_medium + yield_medium");
@@ -1334,7 +1338,7 @@ fn test_concurrent_deposits_and_withdrawals_multiple_terms() {
     h.set_time(deposit_ts + long_term + 1);
     let elapsed_long = h.now() - deposit_ts;
     let yield_long = expected_yield(amount_long, yield_rate, elapsed_long);
-    h.mint_to_vault(yield_long);
+    h.fund_yield(yield_long);
 
     h.client.withdraw(&h.user, &long_term, &amount_long);
     
