@@ -796,3 +796,90 @@ fn test_repay_credits_interest_to_lender_balance() {
         "token_client.balance(&lender) should equal deposit + interest"
     );
 }
+
+/// AC-041 (#763): a lender's `Balance` is their gross claim and is not reduced
+/// by borrowing; lent-out principal lives in `Borrowed`. The pool-wide
+/// invariant `sum(Balance) - sum(Borrowed) == SAC balance` must hold after
+/// deposits, borrows, partial/full repayments with accrued interest, and
+/// withdrawals.
+#[test]
+fn test_accounting_invariant_holds_through_interest_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+    let admin = Address::generate(&env);
+    let acbu_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let contract_id = env.register_contract(None, LendingPool);
+    let client = LendingPoolClient::new(&env, &contract_id);
+    client.initialize(&admin, &acbu_token, &1_000i128); // 10% APR
+
+    let token_admin = StellarAssetClient::new(&env, &acbu_token);
+    let token_client = TokenClient::new(&env, &acbu_token);
+
+    let assert_invariant = |label: &str| {
+        let tracked = client.get_total_lender_balance() - client.get_active_loans_liquidity();
+        assert_eq!(
+            tracked,
+            token_client.balance(&contract_id),
+            "invariant broken after {}",
+            label
+        );
+    };
+
+    let lender_a = Address::generate(&env);
+    let lender_b = Address::generate(&env);
+    token_admin.mint(&lender_a, &10_000_000);
+    token_admin.mint(&lender_b, &5_000_000);
+    client.deposit(&lender_a, &10_000_000);
+    client.deposit(&lender_b, &5_000_000);
+    assert_eq!(client.get_total_lender_balance(), 15_000_000);
+    assert_invariant("deposits");
+
+    let borrower = Address::generate(&env);
+    client.borrow(&borrower, &lender_a, &1_000_000, &1);
+    client.borrow(&borrower, &lender_b, &2_000_000, &2);
+
+    // Borrowing leaves gross Balance untouched and moves principal to Borrowed.
+    assert_eq!(client.get_balance(&lender_a), 10_000_000);
+    assert_eq!(client.get_borrowed(&lender_a), 1_000_000);
+    assert_eq!(client.get_available_balance(&lender_a), 9_000_000);
+    assert_eq!(client.get_available_balance(&lender_b), 3_000_000);
+    assert_invariant("borrows");
+
+    // One year of accrual.
+    env.ledger().with_mut(|l| l.timestamp += 31_536_000);
+    let interest_a = client.get_loan(&borrower, &1).unwrap().accrued_interest;
+    let interest_b = client.get_loan(&borrower, &2).unwrap().accrued_interest;
+    assert_eq!(interest_a, 100_000);
+    assert_eq!(interest_b, 200_000);
+
+    // Partial repayment covering interest plus some principal on loan 2.
+    token_admin.mint(&borrower, &(interest_b + 500_000));
+    client.repay(&borrower, &(interest_b + 500_000), &2);
+    assert_eq!(client.get_balance(&lender_b), 5_000_000 + interest_b);
+    assert_eq!(client.get_borrowed(&lender_b), 1_500_000);
+    assert_invariant("partial repay with interest");
+
+    // Full repayment of loan 1.
+    token_admin.mint(&borrower, &(1_000_000 + interest_a));
+    client.repay(&borrower, &(1_000_000 + interest_a), &1);
+    assert_eq!(client.get_borrowed(&lender_a), 0);
+    assert_eq!(client.get_available_balance(&lender_a), 10_000_000 + interest_a);
+    assert_invariant("full repay with interest");
+
+    // Lenders withdraw everything that is available.
+    client.withdraw(&lender_a, &(10_000_000 + interest_a));
+    let available_b = client.get_available_balance(&lender_b);
+    client.withdraw(&lender_b, &available_b);
+    assert_invariant("withdrawals");
+
+    // Only lender B's outstanding principal remains tracked, and the contract
+    // holds nothing since that principal sits with the borrower.
+    assert_eq!(client.get_total_lender_balance(), 1_500_000);
+    assert_eq!(client.get_active_loans_liquidity(), 1_500_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
