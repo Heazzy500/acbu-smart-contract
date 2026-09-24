@@ -318,6 +318,10 @@ pub enum ContractError {
     /// the trusted KYC authority (zk_verifier trusted commitment registry,
     /// AZ-002).
     CommitmentNotAttested = 15,
+    /// The `public_inputs` slice does not match the expected length.
+    InvalidPublicInputsLength = 16,
+    /// The nullifier has already been spent for this commitment.
+    NullifierAlreadySpent = 17,
 
     Unknown = 9999,
 }
