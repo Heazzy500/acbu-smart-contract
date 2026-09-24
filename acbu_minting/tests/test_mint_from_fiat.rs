@@ -100,14 +100,14 @@ fn setup_test(
     let acbu_sac = env.register_stellar_asset_contract_v2(contract_id.clone());
     let acbu_token = acbu_sac.address();
 
-    let usdc_token = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
+    let usdc_sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let usdc_token = usdc_sac.address();
 
     let client = MintingContractClient::new(env, &contract_id);
 
     // C-058 recipients are ed25519 accounts; SAC mint needs their trustline.
     establish_trustline(env, &account(env), &acbu_sac);
+    establish_trustline(env, &account(env), &usdc_sac);
 
     (
         admin,
@@ -647,4 +647,51 @@ fn test_mint_from_fiat_admin_when_operator_set() {
         &fiat_amount,
         &fintech_tx_id,
     );
+}
+
+#[test]
+fn test_mint_from_usdc_routes_fee_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
+    let user = account(&env);
+    let treasury = Address::generate(&env);
+    let vault = Address::generate(&env);
+
+    let fee_rate = 300i128; // 3%
+    let fee_single = 100i128;
+
+    init_mint_client(
+        &env,
+        &client,
+        &admin,
+        &oracle,
+        &reserve_tracker,
+        &acbu_token_id,
+        &usdc_token_id,
+        &vault,
+        &treasury,
+        fee_rate,
+        fee_single,
+    );
+
+    let usdc_sac = soroban_sdk::token::StellarAssetClient::new(&env, &usdc_token_id);
+    let usdc_client = soroban_sdk::token::Client::new(&env, &usdc_token_id);
+    let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token_id);
+
+    let mint_amount = 50 * DECIMALS;
+    usdc_sac.mint(&user, &mint_amount);
+
+    let expected_fee = shared::calculate_fee(mint_amount, fee_rate).unwrap(); // 15_000_000
+    let expected_acbu = mint_amount - expected_fee; // 485_000_000
+
+    let minted = client.mint_from_usdc(&user, &mint_amount, &user, &None);
+
+    assert_eq!(minted, expected_acbu, "minted should equal expected_acbu");
+    assert_eq!(acbu_client.balance(&user), expected_acbu, "user should receive acbu after fee");
+    // Verify ACBU fee was routed to treasury
+    assert_eq!(acbu_client.balance(&treasury), expected_fee, "treasury should receive the ACBU fee");
+    // Verify contract retains total deposited USDC as reserve backing
+    assert_eq!(usdc_client.balance(&client.address), mint_amount, "contract should hold total USDC as reserve backing");
 }
