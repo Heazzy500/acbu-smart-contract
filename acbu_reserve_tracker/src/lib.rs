@@ -6,8 +6,9 @@ use soroban_sdk::{
 };
 
 use shared::{
-    CurrencyCode, DataKey as SharedDataKey, ReserveData, BASIS_POINTS, CONTRACT_VERSION, DECIMALS,
-    ORACLE_GET_ACBU_RATE, ORACLE_GET_RATE_WITH_TS, TOKEN_GET_TOTAL_SUPPLY,
+    check_oracle_freshness, CurrencyCode, DataKey as SharedDataKey, ReserveData, BASIS_POINTS,
+    CONTRACT_VERSION, DECIMALS, ORACLE_GET_ACBU_RATE, ORACLE_GET_RATE_WITH_TS,
+    TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
 };
 
 #[contracterror]
@@ -30,6 +31,7 @@ pub enum ReserveTrackerError {
     DuplicateCurrency = 8016,
     NoPendingUpgrade = 8012,
     TimelockNotElapsed = 8013,
+    OracleStale = 8017,
     Unknown = 8999,
 }
 
@@ -52,6 +54,7 @@ impl Display for ReserveTrackerError {
             Self::DuplicateCurrency => "currency already tracked",
             Self::NoPendingUpgrade => "no pending upgrade",
             Self::TimelockNotElapsed => "timelock has not elapsed",
+            Self::OracleStale => "oracle rate is stale",
             Self::Unknown => "unknown reserve tracker error",
         };
         f.write_str(message)
@@ -247,11 +250,15 @@ impl ReserveTrackerContract {
         }
 
         let oracle_addr: Address = env.storage().instance().get(&DATA_KEY.oracle).unwrap();
-        let (rate, _rate_timestamp): (i128, u64) = env.invoke_contract(
+        let (rate, rate_timestamp): (i128, u64) = env.invoke_contract(
             &oracle_addr,
             &Symbol::new(&env, ORACLE_GET_RATE_WITH_TS),
             vec![&env, currency.clone().into_val(&env)],
         );
+
+        if !check_oracle_freshness(&env, rate_timestamp, UPDATE_INTERVAL_SECONDS) {
+            env.panic_with_error(ReserveTrackerError::OracleStale);
+        }
 
         let expected_value_usd = amount
             .checked_mul(rate)
