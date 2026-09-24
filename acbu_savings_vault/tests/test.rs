@@ -40,7 +40,8 @@ fn test_withdraw_after_term_has_correct_30day_yield() {
 
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
     token_admin.mint(&user, &deposit_amount);
-    token_admin.mint(&contract_id, &expected_yield);
+    token_admin.mint(&admin, &expected_yield);
+    client.fund_yield_reserve(&admin, &expected_yield);
 
     client.deposit(&user, &deposit_amount, &term_seconds);
 
@@ -103,7 +104,8 @@ fn test_withdraw_after_one_year_has_positive_yield_and_event_value() {
 
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
     token_admin.mint(&user, &deposit_amount);
-    token_admin.mint(&contract_id, &expected_yield);
+    token_admin.mint(&admin, &expected_yield);
+    client.fund_yield_reserve(&admin, &expected_yield);
 
     client.deposit(&user, &deposit_amount, &term_seconds);
 
@@ -166,7 +168,8 @@ fn test_partial_withdraw_and_multiple_deposits_fifo_yield() {
 
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
     token_admin.mint(&user, &(lot_1 + lot_2));
-    token_admin.mint(&contract_id, &expected_yield);
+    token_admin.mint(&admin, &expected_yield);
+    client.fund_yield_reserve(&admin, &expected_yield);
 
     client.deposit(&user, &lot_1, &term_seconds);
 
@@ -431,7 +434,8 @@ fn test_withdraw_event_yield_amount_nonzero_issue_225() {
 
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
     token_admin.mint(&user, &principal);
-    token_admin.mint(&contract_id, &expected_yield);
+    token_admin.mint(&admin, &expected_yield);
+    client.fund_yield_reserve(&admin, &expected_yield);
 
     client.deposit(&user, &principal, &term_seconds);
     env.ledger()

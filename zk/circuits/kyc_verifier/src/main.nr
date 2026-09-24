@@ -268,3 +268,131 @@ fn test_score_boundary_90_becomes_tier3() {
         3,
     );
 }
+
+// ── Negative tests (AZ-019) ─────────────────────────────────────────────────
+// Assert that constraint failures reject proofs. Without these, a regression
+// that weakens tier/country/score checks would still pass CI.
+
+#[test(should_fail_with = "account tier does not meet minimum requirement")]
+fn test_rejects_under_kyc_tier_below_min() {
+    // Score 50 → tier 1, but min_tier requires 2 (under-KYC'd).
+    main(
+        2,              // min_tier
+        566,            // NG (allowed for tier 1, irrelevant here)
+        100_000_000,    // 10 ACBU
+        1_000_000_000,  // cap
+        0,
+        50,             // kyc_score → tier 1
+        1,              // tier
+    );
+}
+
+#[test(should_fail_with = "country not on tier-1 allow-list")]
+fn test_rejects_wrong_country_for_tier1() {
+    // Tier 1 with US (840) — not on the Africa allow-list.
+    main(
+        1,
+        840,            // US — wrong country for tier 1
+        100_000_000,
+        1_000_000_000,
+        0,
+        50,
+        1,
+    );
+}
+
+#[test(should_fail_with = "tier must match kyc_score")]
+fn test_rejects_mismatched_tier_and_score() {
+    // Private inputs inconsistent: score 95 derives tier 3, but claimed tier is 2.
+    // Analogous to a wrong-nullifier / forged witness regression.
+    main(
+        2,
+        566,
+        100_000_000,
+        100_000_000_000,
+        0,
+        95,             // derives tier 3
+        2,              // claimed tier 2 — mismatch
+    );
+}
+
+#[test(should_fail_with = "tier 0 accounts cannot transact")]
+fn test_rejects_tier0_blocked() {
+    main(
+        0,
+        566,
+        100_000_000,
+        1_000_000_000,
+        0,
+        10,             // score < 30 → tier 0
+        0,
+    );
+}
+
+#[test(should_fail_with = "requested_amount must be positive")]
+fn test_rejects_zero_requested_amount() {
+    main(
+        1,
+        566,
+        0,              // zero amount
+        1_000_000_000,
+        0,
+        50,
+        1,
+    );
+}
+
+#[test(should_fail_with = "daily cap exceeded")]
+fn test_rejects_daily_cap_exceeded() {
+    // already_used 90 + request 20 > cap 100
+    main(
+        1,
+        566,
+        200_000_000,    // 20 ACBU
+        1_000_000_000,  // 100 ACBU cap
+        900_000_000,    // 90 ACBU already used
+        50,
+        1,
+    );
+}
+
+#[test(should_fail_with = "kyc_score must be <= 100")]
+fn test_rejects_kyc_score_out_of_range() {
+    main(
+        1,
+        566,
+        100_000_000,
+        1_000_000_000,
+        0,
+        101,            // invalid score
+        1,
+    );
+}
+
+#[test(should_fail_with = "account tier does not meet minimum requirement")]
+fn test_rejects_tier2_when_min_tier3_required() {
+    // Score 70 → tier 2 cannot satisfy institutional min_tier 3.
+    main(
+        3,
+        566,
+        100_000_000,
+        0xFFFFFFFFFFFFFFFF,
+        0,
+        70,
+        2,
+    );
+}
+
+#[test(should_fail_with = "country not on tier-1 allow-list")]
+fn test_rejects_tier1_china_not_allowlisted() {
+    // China (156) is outside the tier-1 allow-list.
+    main(
+        1,
+        156,            // CN
+        100_000_000,
+        1_000_000_000,
+        0,
+        40,
+        1,
+    );
+}

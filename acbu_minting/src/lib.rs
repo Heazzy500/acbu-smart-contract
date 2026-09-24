@@ -64,6 +64,8 @@ pub struct DataKey {
     /// `Vec<Address>` of circuit-breaker peers (burning, reserve tracker, …) whose
     /// pause also halts minting (AC-030).
     pub circuit_peers: Symbol,
+    /// Burning contract authorised to report burns via `record_burn` (AC-005).
+    pub burning_contract: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -90,6 +92,7 @@ const DATA_KEY: DataKey = DataKey {
     proof_prefix: symbol_short!("PRF_SET"),
     tx_nonce: symbol_short!("TX_NONCE"),
     circuit_peers: symbol_short!("CB_PEERS"),
+    burning_contract: symbol_short!("BURN_CTR"),
 };
 
 /// Admin rotation timelock: the pending admin must wait this long before
@@ -139,6 +142,10 @@ pub enum MintingError {
     ArithmeticOverflow = 5028,
     /// The circuit-breaker peer list is invalid (too long, duplicate, or self).
     InvalidCircuitPeer = 5029,
+    /// `record_burn` called while no burning contract is linked (AC-005).
+    BurningContractNotSet = 5030,
+    /// `record_burn` called with a non-positive amount (AC-005).
+    InvalidBurnAmount = 5031,
     Unknown = 5999,
 }
 
@@ -174,6 +181,8 @@ impl Display for MintingError {
             Self::NegativeSupply => "negative supply",
             Self::ArithmeticOverflow => "arithmetic overflow in fee calculation",
             Self::InvalidCircuitPeer => "invalid circuit-breaker peer",
+            Self::BurningContractNotSet => "burning contract not set",
+            Self::InvalidBurnAmount => "invalid burn amount",
             Self::Unknown => "unknown minting error",
         };
         f.write_str(message)
@@ -221,6 +230,15 @@ pub struct OperatorUpdatedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SupplySyncedEvent {
+    pub old_supply: i128,
+    pub new_supply: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SupplyBurnedEvent {
+    pub amount: i128,
     pub old_supply: i128,
     pub new_supply: i128,
     pub timestamp: u64,
@@ -316,7 +334,7 @@ impl MintingContract {
         min_acbu_out: Option<i128>,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -438,7 +456,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -453,7 +470,7 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -618,7 +635,6 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -634,7 +650,7 @@ impl MintingContract {
         s_token_amount: i128,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         user.require_auth();
@@ -768,7 +784,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -785,7 +800,7 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
@@ -927,7 +942,6 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -944,7 +958,7 @@ impl MintingContract {
         fintech_tx_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
@@ -1098,7 +1112,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -1155,7 +1168,6 @@ impl MintingContract {
         }
         token.transfer(&custody, &recipient, &amount);
 
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Return the operator address (the key authorized to sign day-to-day mint
@@ -1243,6 +1255,60 @@ impl MintingContract {
             timestamp: env.ledger().timestamp(),
         };
         env.events().publish((symbol_short!("sup_sync"),), event);
+    }
+
+    /// Link the burning contract allowed to report burns via
+    /// [`Self::record_burn`] (admin only, AC-005).
+    pub fn set_burning_contract(env: Env, burning_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.burning_contract, &burning_contract);
+        env.events()
+            .publish((symbol_short!("burn_ctr"),), burning_contract);
+    }
+
+    /// Return the linked burning contract, if any.
+    pub fn get_burning_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DATA_KEY.burning_contract)
+    }
+
+    /// Decrement the tracked total supply by `amount` after an ACBU burn
+    /// (AC-005). Callable only by the linked burning contract.
+    ///
+    /// Deliberately not gated on pause: the burn has already happened on the
+    /// token, so the tracker must follow it or it drifts above real supply and
+    /// skews `check_supply_cap` / reserve checks. Saturates at zero so a
+    /// tracker that was already under-counting cannot block redemptions;
+    /// `sync_supply` remains the tool for full reconciliation.
+    pub fn record_burn(env: Env, amount: i128) {
+        let burning_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.burning_contract)
+            .unwrap_or_else(|| env.panic_with_error(MintingError::BurningContractNotSet));
+        burning_contract.require_auth();
+        if amount <= 0 {
+            env.panic_with_error(MintingError::InvalidBurnAmount);
+        }
+
+        let old_supply: i128 = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.total_supply)
+            .unwrap_or(0);
+        let new_supply = old_supply.saturating_sub(amount).max(0);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.total_supply, &new_supply);
+        let event = SupplyBurnedEvent {
+            amount,
+            old_supply,
+            new_supply,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.events().publish((symbol_short!("sup_burn"),), event);
     }
 
     /// Return the current tracked total ACBU supply (7 decimals).
@@ -1636,6 +1702,7 @@ impl MintingContract {
         env.storage().instance().has(&SharedDataKey::Version)
     }
 
+    #[allow(dead_code)]
     fn check_admin(env: &Env) {
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
@@ -1754,13 +1821,14 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
     let digest = env.crypto().sha256(&preimage).to_array();
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let prefix_bytes = prefix.as_bytes();
-    let mut buf = [0u8; 80];
+    // prefix + '_' + 64 hex chars; panic early if prefix is unreasonably long
+    assert!(prefix_bytes.len() <= 64, "tx_id prefix too long");
+    let total = prefix_bytes.len() + 1 + 64;
+    let mut buf = [0u8; 129]; // 64 (max prefix) + 1 + 64
     let mut offset = 0usize;
 
-    for &b in prefix_bytes.iter() {
-        buf[offset] = b;
-        offset += 1;
-    }
+    buf[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
+    offset += prefix_bytes.len();
     buf[offset] = b'_';
     offset += 1;
 
@@ -1772,7 +1840,7 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
 
     SorobanString::from_str(
         env,
-        core::str::from_utf8(&buf[..offset]).unwrap_or("mint_invalid_tx_id"),
+        core::str::from_utf8(&buf[..total]).unwrap_or("mint_invalid_tx_id"),
     )
 }
 

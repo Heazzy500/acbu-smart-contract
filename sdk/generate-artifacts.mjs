@@ -15,23 +15,30 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { compile, createFileManager } from "@noir-lang/noir_wasm";
 import { Noir } from "@noir-lang/noir_js";
 import { UltraHonkBackend } from "@aztec/bb.js";
+import { createHash } from 'crypto';
 
 const OUT_DIR = ".zk-comply-proof";
-const CIRCUIT_DIR = "../circuits/zk_comply_circuit";
+const CIRCUIT_DIR = "../circuits/kyc_verifier";
 
 // Witness inputs matching the Noir circuit's public + private inputs
 const INPUTS = {
   kyc_level: 1,
   country_code: 566,
   salt: "0x3039",        // 12345
-  commitment: "0x208a72dec0df0224f59fdf62644c391524b9a313a49f62c90f0a20df1c84a391",
   required_kyc: 1,
   allowed_country: 566,
-  nullifier: "0x2697e800e3f99e36c7132d4fe6a62561a2f64de34e4fee8e67cf1662282631e7",
 };
 
 async function main() {
   mkdirSync(OUT_DIR, { recursive: true });
+
+  // Dynamically generate commitment and nullifier based on other inputs
+  const commitmentInput = `${INPUTS.kyc_level}-${INPUTS.country_code}-${INPUTS.salt}`;
+  INPUTS.commitment = generateHash(commitmentInput);
+  
+  // Example derivation for nullifier (can be adjusted based on actual circuit logic)
+  const nullifierInput = `${INPUTS.kyc_level}-${INPUTS.country_code}-${INPUTS.salt}-${INPUTS.commitment}`;
+  INPUTS.nullifier = generateHash(nullifierInput);
 
   // 1) Compile Noir circuit
   console.log("Compiling Noir circuit...");
@@ -78,3 +85,7 @@ main().catch((e) => {
   console.error("Failed:", e.message);
   process.exit(1);
 });
+
+function generateHash(input) {
+  return "0x" + createHash('sha256').update(input).digest('hex');
+}

@@ -2,8 +2,16 @@ const API_BASE =
   import.meta.env.VITE_ACBU_API_URL ||
   "https://acbu-backend.onrender.com/api/v1";
 
+/**
+ * Auth options are intentionally separate:
+ * - `token` → Authorization: Bearer (JWT session)
+ * - `apiKey` → x-api-key (ACBU API key, e.g. acbu_<lookup>_<secret>)
+ *
+ * Never reuse the same credential across both headers (AZ-022).
+ */
 interface RequestOptions {
   token?: string;
+  apiKey?: string;
 }
 
 class ApiError extends Error {
@@ -27,6 +35,9 @@ async function request<T>(
   };
   if (opts?.token) {
     headers["Authorization"] = `Bearer ${opts.token}`;
+  }
+  if (opts?.apiKey) {
+    headers["x-api-key"] = opts.apiKey;
   }
 
   const res = await fetch(`${API_BASE}${path}`, {

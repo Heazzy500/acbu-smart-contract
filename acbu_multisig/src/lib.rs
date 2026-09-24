@@ -22,6 +22,16 @@
 //!    admin function in the same transaction, with this contract as the auth
 //!    source in the Soroban auth tree.
 //!
+//! ## Self-governance (AC-006)
+//!
+//! The multisig's own signer set and WASM are changed through proposals that
+//! carry the action's parameters: `propose_update_config` and
+//! `propose_upgrade`. Once such a proposal reaches the threshold, `execute`
+//! applies the bound action itself. There is no separate entry point gated on
+//! `current_contract_address().require_auth()` — that auth can only be
+//! satisfied by the contract invoking itself, which never happens, so it
+//! would lock the signer set and WASM forever.
+//!
 //! ## Expiry
 //!
 //! Proposals expire after `PROPOSAL_TTL_SECONDS` (48 hours by default).
@@ -36,8 +46,8 @@ use soroban_sdk::{
 };
 
 use shared::{
-    AdminProposal, MultisigConfig, ProposalApprovedEvent, ProposalCreatedEvent,
-    ProposalExecutedEvent, DataKey as SharedDataKey, CONTRACT_VERSION,
+    AdminProposal, DataKey as SharedDataKey, MultisigConfig, ProposalApprovedEvent,
+    ProposalCreatedEvent, ProposalExecutedEvent, CONTRACT_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +73,20 @@ pub enum DataKey {
     NextId,
     /// AdminProposal keyed by proposal_id (u64)
     Proposal(u64),
+    /// GovernanceAction bound to a self-governance proposal, applied by
+    /// `execute` (AC-006).
+    Action(u64),
+}
+
+/// Action on the multisig itself, bound to a proposal at creation time and
+/// applied by `execute` once the threshold is met (AC-006).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernanceAction {
+    /// Replace the signer list and threshold.
+    UpdateConfig(MultisigConfig),
+    /// Replace this contract's WASM.
+    Upgrade(BytesN<32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -151,20 +175,61 @@ impl MultisigContract {
     ///
     /// Returns the new `proposal_id`.
     pub fn propose(env: Env, proposer: Address, action_tag: SorobanString) -> u64 {
-        proposer.require_auth();
-        let config = Self::load_config(&env);
-        Self::assert_is_signer(&env, &proposer, &config);
+        Self::create_proposal(&env, proposer, action_tag)
+    }
 
-        let proposal_id: u64 = env
-            .storage()
+    /// Propose replacing the signer list and threshold (AC-006).
+    ///
+    /// The new config is validated now and bound to the proposal; `execute`
+    /// applies it once the current threshold is met. Returns the `proposal_id`.
+    pub fn propose_update_config(
+        env: Env,
+        proposer: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+    ) -> u64 {
+        Self::validate_config(&env, &new_signers, new_threshold);
+        let action = GovernanceAction::UpdateConfig(MultisigConfig {
+            signers: new_signers,
+            threshold: new_threshold,
+        });
+        Self::create_action_proposal(&env, proposer, "update_config", action)
+    }
+
+    /// Propose upgrading this contract to `new_wasm_hash` (AC-006).
+    ///
+    /// `execute` performs the upgrade once the threshold is met. Returns the
+    /// `proposal_id`.
+    pub fn propose_upgrade(env: Env, proposer: Address, new_wasm_hash: BytesN<32>) -> u64 {
+        let action = GovernanceAction::Upgrade(new_wasm_hash);
+        Self::create_action_proposal(&env, proposer, "upgrade", action)
+    }
+
+    fn create_action_proposal(
+        env: &Env,
+        proposer: Address,
+        action_tag: &str,
+        action: GovernanceAction,
+    ) -> u64 {
+        let proposal_id =
+            Self::create_proposal(env, proposer, SorobanString::from_str(env, action_tag));
+        env.storage()
             .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+            .set(&DataKey::Action(proposal_id), &action);
+        proposal_id
+    }
+
+    fn create_proposal(env: &Env, proposer: Address, action_tag: SorobanString) -> u64 {
+        proposer.require_auth();
+        let config = Self::load_config(env);
+        Self::assert_is_signer(env, &proposer, &config);
+
+        let proposal_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let expires_at = env.ledger().timestamp() + PROPOSAL_TTL_SECONDS;
 
         // The proposer's approval is counted immediately.
-        let mut approvals = Vec::new(&env);
+        let mut approvals = Vec::new(env);
         approvals.push_back(proposer.clone());
 
         let proposal = AdminProposal {
@@ -243,9 +308,11 @@ impl MultisigContract {
     /// The executor must be a registered signer.  After this call the proposal
     /// is marked executed and cannot be re-executed.
     ///
-    /// The caller is responsible for invoking the target contract's admin
-    /// function in the same transaction, using this contract's address as the
-    /// auth source in the Soroban auth tree.
+    /// If the proposal carries a [`GovernanceAction`] (created via
+    /// `propose_update_config` / `propose_upgrade`), it is applied here.
+    /// Otherwise the caller is responsible for invoking the target contract's
+    /// admin function in the same transaction, using this contract's address
+    /// as the auth source in the Soroban auth tree.
     pub fn execute(env: Env, executor: Address, proposal_id: u64) {
         executor.require_auth();
         let config = Self::load_config(&env);
@@ -283,41 +350,25 @@ impl MultisigContract {
                 executed_by: executor,
             },
         );
-    }
 
-    // -----------------------------------------------------------------------
-    // Configuration management (requires M-of-N via this contract itself)
-    // -----------------------------------------------------------------------
-
-    /// Replace the signer list and threshold.
-    ///
-    /// This function requires the **multisig contract itself** to be the
-    /// authoriser — i.e. a proposal must have been approved and executed
-    /// before this can be called.  This prevents a single compromised key
-    /// from rotating the signer set.
-    pub fn update_config(env: Env, new_signers: Vec<Address>, new_threshold: u32) {
-        // Require auth from this contract's own address — only reachable after
-        // a successful `execute()` call in the same transaction.
-        env.current_contract_address().require_auth();
-
-        Self::validate_config(&env, &new_signers, new_threshold);
-
-        let config = MultisigConfig {
-            signers: new_signers,
-            threshold: new_threshold,
-        };
-        env.storage().instance().set(&DataKey::Config, &config);
-    }
-
-    // -----------------------------------------------------------------------
-    // Upgrade
-    // -----------------------------------------------------------------------
-
-    /// Upgrade the contract WASM.  Requires this contract's own auth (i.e. a
-    /// completed multisig proposal).
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        env.current_contract_address().require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        let action: Option<GovernanceAction> =
+            env.storage().instance().get(&DataKey::Action(proposal_id));
+        match action {
+            Some(GovernanceAction::UpdateConfig(new_config)) => {
+                // Re-validate: the bound config was checked at proposal time,
+                // but keep the invariant local to the write.
+                Self::validate_config(&env, &new_config.signers, new_config.threshold);
+                env.storage().instance().set(&DataKey::Config, &new_config);
+                env.events()
+                    .publish((symbol_short!("cfg_upd"), proposal_id), new_config);
+            }
+            Some(GovernanceAction::Upgrade(new_wasm_hash)) => {
+                env.events()
+                    .publish((symbol_short!("upgraded"), proposal_id), new_wasm_hash.clone());
+                env.deployer().update_current_contract_wasm(new_wasm_hash);
+            }
+            None => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -336,6 +387,11 @@ impl MultisigContract {
             .instance()
             .get(&DataKey::Proposal(proposal_id))
             .unwrap_or_else(|| env.panic_with_error(Error::ProposalNotFound))
+    }
+
+    /// Return the governance action bound to `proposal_id`, if any.
+    pub fn get_action(env: Env, proposal_id: u64) -> Option<GovernanceAction> {
+        env.storage().instance().get(&DataKey::Action(proposal_id))
     }
 
     /// Return the id that will be assigned to the next created proposal.

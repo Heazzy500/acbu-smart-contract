@@ -41,12 +41,10 @@ function mapCountry(countryCode?: string): {
   name: string;
 } {
   if (!countryCode) return { code: 0, name: "Unknown" };
-  return (
-    COUNTRY_MAP[countryCode.toUpperCase()] || {
-      code: parseInt(countryCode) || 0,
-      name: countryCode,
-    }
-  );
+  return COUNTRY_MAP[countryCode.toUpperCase()] || {
+    code: parseInt(countryCode) || 0,
+    name: countryCode,
+  };
 }
 
 export function useIdentity(apiKey: string | null) {
@@ -65,7 +63,7 @@ export function useIdentity(apiKey: string | null) {
       kyc_status?: string;
       country_code?: string;
       stellar_address?: string;
-    }>("/users/me", { token: apiKey })
+    }>("/users/me", { apiKey })
       .then((user) => {
         const country = mapCountry(user.country_code);
         setIdentity({
@@ -77,7 +75,7 @@ export function useIdentity(apiKey: string | null) {
         });
         setLoading(false);
       })
-      .catch((err: Error) => {
+      .catch((err) => {
         setError(err.message || "Failed to load identity");
         setLoading(false);
       });
