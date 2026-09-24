@@ -135,6 +135,7 @@ const VERIFY_RESERVES_COOLDOWN_SECONDS: u64 = 60;
 /// Maximum age of an attestation before external systems should consider
 /// it stale. The custodian is expected to submit fresh attestations within
 /// this window. 24 hours.
+#[allow(dead_code)]
 const ATTESTATION_MAX_AGE_SECONDS: u64 = 86_400;
 
 contractmeta!(key = "version", val = "1");
@@ -223,6 +224,7 @@ impl ReserveTrackerContract {
     /// Like [`Self::verify_reserves`] but uses the caller-supplied
     /// `total_acbu_supply` instead of querying the token contract. Returns `true`
     /// if reserves meet the minimum ratio.
+    #[allow(dead_code)]
     fn verify_reserves_manual(env: Env, total_acbu_supply: i128) -> bool {
         Self::is_reserve_sufficient(env, total_acbu_supply)
     }

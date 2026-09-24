@@ -230,7 +230,7 @@ impl LendingPool {
         if env.storage().instance().has(&DataKey::Admin) {
             env.panic_with_error(Error::AlreadyInitialized);
         }
-        if fee_rate_bps < 0 || fee_rate_bps > BASIS_POINTS {
+        if !(0..=BASIS_POINTS).contains(&fee_rate_bps) {
             env.panic_with_error(Error::InvalidAmount);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -839,9 +839,8 @@ impl LendingPool {
             .remove(&DataKey::PendingUpgradeEligibleAt);
         env.deployer().update_current_contract_wasm(wasm_hash);
         for v in current_version..new_version {
-            match v {
-                0 => shared::migrate_v0_to_v1(&env),
-                _ => {}
+            if v == 0 {
+                shared::migrate_v0_to_v1(&env)
             }
         }
         env.storage()
@@ -923,7 +922,7 @@ impl LendingPool {
         // privilege boundary visible at the call site.
         Self::check_admin(&env);
 
-        if new_rate_bps < 0 || new_rate_bps > BASIS_POINTS {
+        if !(0..=BASIS_POINTS).contains(&new_rate_bps) {
             env.panic_with_error(Error::InvalidAmount);
         }
 

@@ -208,7 +208,8 @@ impl SavingsVault {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
-    /// Extends the temporary storage entry backing a user's deposit lots for
+    // Extends the temporary storage entry backing a user's deposit lots for
+    // the configured TTL window. Called internally before every read/write.
 
     // -----------------------------------------------------------------------
     // Public logic

@@ -1636,6 +1636,7 @@ impl MintingContract {
         env.storage().instance().has(&SharedDataKey::Version)
     }
 
+    #[allow(dead_code)]
     fn check_admin(env: &Env) {
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();

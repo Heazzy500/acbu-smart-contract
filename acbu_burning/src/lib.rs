@@ -79,6 +79,7 @@ impl BurningContract {
     /// Sets up all required addresses and fee parameters. Panics if called a
     /// second time (`admin` key already exists) or if either fee rate is
     /// outside [0, BASIS_POINTS].
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         admin: Address,
