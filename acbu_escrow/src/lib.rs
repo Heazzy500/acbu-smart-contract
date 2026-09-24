@@ -306,6 +306,8 @@ impl Escrow {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
+        Self::check_paused(&env);
+
         let admin = Self::load_admin(&env).unwrap_or_else(|e| env.panic_with_error(e));
 
         let key = EscrowId(payer.clone(), escrow_id);
