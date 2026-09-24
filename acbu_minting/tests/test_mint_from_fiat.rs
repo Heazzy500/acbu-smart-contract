@@ -744,3 +744,41 @@ fn test_mint_from_basket_returns_net_mint() {
     assert_eq!(acbu_client.balance(&user), expected_net, "user must receive net_mint");
     assert_eq!(acbu_client.balance(&treasury), expected_fee, "treasury must receive fee");
 }
+
+#[test]
+#[should_panic(expected = "#5023")]
+fn test_mint_from_fiat_rejects_contract_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
+    let operator = Address::generate(&env);
+    let contract_recipient = Address::generate(&env);
+
+    init_mint_client(
+        &env,
+        &client,
+        &admin,
+        &oracle,
+        &reserve_tracker,
+        &acbu_token_id,
+        &usdc_token_id,
+        &admin,
+        &admin,
+        50,
+        100,
+    );
+
+    client.set_operator(&operator);
+
+    let fiat_amount = 50 * DECIMALS;
+    let fintech_tx_id = SorobanString::from_str(&env, "fintech_tx_contract_recip");
+
+    client.mint_from_fiat(
+        &operator,
+        &contract_recipient,
+        &CurrencyCode::new(&env, "NGN"),
+        &fiat_amount,
+        &fintech_tx_id,
+    );
+}

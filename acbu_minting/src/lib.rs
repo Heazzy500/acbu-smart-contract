@@ -1711,12 +1711,20 @@ impl MintingContract {
     fn assert_recipient_is_account(address: &Address) {
         let env = address.env();
         let strkey = address.to_string();
-        if strkey.len() != 56 {
-            env.panic_with_error(MintingError::InvalidRecipient);
-        }
-        let mut buf = [0u8; 56];
-        strkey.copy_into_slice(&mut buf);
-        if buf[0] != b'G' {
+        let len = strkey.len();
+        if len == 56 {
+            let mut buf = [0u8; 56];
+            strkey.copy_into_slice(&mut buf);
+            if buf[0] != b'G' {
+                env.panic_with_error(MintingError::InvalidRecipient);
+            }
+        } else if len == 69 {
+            let mut buf = [0u8; 69];
+            strkey.copy_into_slice(&mut buf);
+            if buf[0] != b'M' {
+                env.panic_with_error(MintingError::InvalidRecipient);
+            }
+        } else {
             env.panic_with_error(MintingError::InvalidRecipient);
         }
     }
