@@ -1411,7 +1411,7 @@ impl OracleContract {
             env.panic_with_error(OracleError::RateNotInitialized);
         }
 
-        let rate = (weighted_sum * BASIS_POINTS) / total_weight;
+        let rate = weighted_sum / total_weight;
         let oldest_timestamp = if oldest_timestamp == u64::MAX {
             0
         } else {
