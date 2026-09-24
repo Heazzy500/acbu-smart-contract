@@ -226,6 +226,8 @@ impl BurningContract {
             }
         }
 
+        // AC-008: same guard as redeem_basket around the value-moving calls.
+        reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
@@ -251,7 +253,7 @@ impl BurningContract {
         env.events()
             .publish((symbol_short!("burn"), user), burn_event);
 
-
+        reentrancy_guard::release_guard(&env);
         stoken_out
     }
 
