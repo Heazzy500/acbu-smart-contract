@@ -250,21 +250,56 @@ shared/
 
 ## Prerequisites
 
-- Rust 1.87.0 (pinned in `rust-toolchain.toml`)
+- Rust 1.88.0 (pinned in `rust-toolchain.toml`)
+- `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`)
 - Soroban CLI (`cargo install --locked soroban-cli`)
 - Stellar account with XLM for deployment fees
+- **Nargo 0.38.0** (pinned — required to build/test ZK circuits in `zk/`)
+
+  ```bash
+  # Install the pinned Nargo version (Linux/macOS)
+  curl -sSL https://github.com/noir-lang/noir/releases/download/v0.38.0/nargo-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xz -C /usr/local/bin
+  nargo --version   # expected: nargo version = 0.38.0
+  ```
+
+  > The Nargo version is enforced by `compiler_version = "=0.38.0"` in
+  > `zk/circuits/*/Nargo.toml` and by `NARGO_VERSION` in
+  > `.github/workflows/circuit-tests.yml`. See [`zk/README.md`](zk/README.md)
+  > for details on upgrading.
+
+> **WASM target** — this project exclusively targets `wasm32-unknown-unknown`.
+> Do **not** use `wasm32v1-none` or any other WASM target; Soroban contracts
+> require `wasm32-unknown-unknown` and the CI pipeline, `rust-toolchain.toml`,
+> `Makefile`, and all build scripts are pinned to that target.
+>
+> ```bash
+> rustup target add wasm32-unknown-unknown
+> ```
+
+## Vendored WASM Artifact
+
+The file `soroban_token_contract.wasm` at the repository root is a **vendored dependency** — it is committed to the repo and required at compile time by the minting, burning, and reserve-tracker contracts via `contractimport!`. Its SHA-256 integrity is verified automatically by `build.rs` during every `cargo build`.
+
+Fresh clones receive this file via `git clone`. If it is ever missing or corrupted, `build.rs` will attempt to re-fetch it automatically via `scripts/fetch_token_wasm.sh`. You can also run the fetch script manually:
+
+```bash
+./scripts/fetch_token_wasm.sh
+```
 
 ## Building
-
-You can use the `Makefile` for common commands.
 
 ```bash
 # Build all contracts in the workspace
 make build
+# or
+cargo build
 
 # Build a specific contract
 make build-minting
 ```
+
+You can use the `Makefile` for common commands. Run `make help` to see all targets.
 
 ## Testing
 

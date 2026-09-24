@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use acbu_oracle::{OracleContract, OracleContractClient};
+use acbu_oracle::{OracleContract, OracleContractClient, StaleRateEvent};
 use shared::{CurrencyCode, OutlierDetectionEvent, RateUpdateEvent};
 use soroban_sdk::{
     symbol_short,
@@ -177,6 +177,51 @@ fn test_admin_set_rate_emits_rate_update_event() {
         }
     }
     assert!(found, "expected rate_upd event");
+}
+
+#[test]
+fn test_stale_rate_event_decodes_from_event_payload() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1_000_000;
+        l.sequence_number = 1;
+    });
+
+    let admin = Address::generate(&env);
+    let validator = Address::generate(&env);
+    let mut validators = Vec::new(&env);
+    validators.push_back(validator);
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    let mut currencies = Vec::new(&env);
+    currencies.push_back(ngn.clone());
+
+    let mut basket_weights = Map::new(&env);
+    basket_weights.set(ngn.clone(), 10000i128);
+
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &validators, &1u32, &currencies, &basket_weights);
+    client.set_rate_admin(&ngn, &1_000_000i128);
+
+    advance_ledger_to(&env, &contract_id, 20_000);
+    let _ = client.try_get_rate(&ngn);
+
+    let stale_event = env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.0 == contract_id
+                && Symbol::from_val(&env, &event.1.get(0).unwrap()) == symbol_short!("stale_rt")
+        })
+        .expect("get_rate must emit stale_rt before returning stale error");
+
+    let decoded: StaleRateEvent = stale_event.2.into_val(&env);
+    assert_eq!(decoded.currency, ngn);
+    assert_eq!(decoded.current_ledger, env.ledger().sequence());
 }
 
 #[test]
@@ -412,9 +457,12 @@ fn test_update_rate_uses_even_source_median_average() {
     // Sorted = [980000, 1000000, 1020000, 1040000], median = (1000000 + 1020000) / 2
     assert_eq!(stored_rate, 1010000, "stored_rate should equal 1010000");
 }
-
 #[test]
-fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
+#[should_panic(expected = "#7009")]
+fn test_update_rate_rejects_empty_sources() {
+    // AC-014 (#737): the source-count quorum applies unconditionally — an
+    // empty submission can no longer store the raw `rate` argument without
+    // median/outlier aggregation.
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
@@ -427,6 +475,7 @@ fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut currencies = Vec::new(&env);
     currencies.push_back(ngn.clone());
+
     let mut basket_weights = Map::new(&env);
     basket_weights.set(ngn.clone(), 10000i128);
 
@@ -443,7 +492,6 @@ fn test_update_rate_falls_back_to_provided_rate_when_sources_empty() {
         &sources,
         &env.ledger().timestamp(),
     );
-    assert_eq!(client.get_rate(&ngn), submitted_rate, "client.get_rate(&ngn) should equal submitted_rate");
 }
 
 // ─── Staleness tests ──────────────────────────────────────────────────────────
@@ -656,6 +704,50 @@ fn test_stale_basket_component_blocks_acbu_rate() {
         result.is_err(),
         "stale basket component must block acbu rate"
     );
+}
+
+/// AC-001: get_acbu_usd_rate_with_timestamp (used by minting and burning) must
+/// return the same 7-decimal basket rate as get_acbu_usd_rate. It previously
+/// omitted the BASIS_POINTS rescale and under-reported the rate by 10,000x.
+#[test]
+fn test_acbu_rate_with_timestamp_matches_acbu_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+    let admin = Address::generate(&env);
+    let validator = Address::generate(&env);
+    let mut validators = Vec::new(&env);
+    validators.push_back(validator.clone());
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    let kes = CurrencyCode::new(&env, "KES");
+    let mut currencies = Vec::new(&env);
+    currencies.push_back(ngn.clone());
+    currencies.push_back(kes.clone());
+    let mut basket_weights = Map::new(&env);
+    basket_weights.set(ngn.clone(), 6_000i128); // 60%
+    basket_weights.set(kes.clone(), 4_000i128); // 40%
+
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &validators, &1u32, &currencies, &basket_weights);
+
+    let now = env.ledger().timestamp();
+    for (currency, rate) in [(ngn.clone(), 1_000_000i128), (kes.clone(), 2_000_000i128)] {
+        let mut sources = Vec::new(&env);
+        sources.push_back(rate);
+        sources.push_back(rate);
+        sources.push_back(rate);
+        client.update_rate(&validator, &currency, &rate, &sources, &now);
+    }
+
+    // 0.6 * 1_000_000 + 0.4 * 2_000_000 = 1_400_000 (7 decimals).
+    let expected = 1_400_000i128;
+    let (rate_ts, ts) = client.get_acbu_usd_rate_with_timestamp();
+    assert_eq!(rate_ts, expected, "basket rate with timestamp must be 7-decimal USD");
+    assert_eq!(client.get_acbu_usd_rate(), rate_ts, "both basket getters must agree");
+    assert_eq!(ts, now, "timestamp should be the oldest contributing rate timestamp");
 }
 
 /// Oracle must return RateNotInitialized error before any rate submissions.

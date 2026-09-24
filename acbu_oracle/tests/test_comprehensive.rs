@@ -63,6 +63,22 @@ fn setup() -> (
     (env, client, contract_id, admin, validators)
 }
 
+/// Submit the same rate from `min_signatures` validators (2 in `setup`) so the
+/// round commits (AC-003).
+fn submit_quorum(
+    env: &Env,
+    client: &OracleContractClient,
+    validators: &Vec<Address>,
+    currency: &CurrencyCode,
+    rate: &i128,
+    sources: &Vec<i128>,
+) {
+    for i in 0..client.get_min_signatures() {
+        let v = validators.get(i).unwrap();
+        client.update_rate(&v, currency, rate, sources, &env.ledger().timestamp());
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // VALIDATOR MANAGEMENT TESTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +164,6 @@ fn test_get_min_signatures() {
 fn test_update_rate_by_validator() {
     let (env, client, _contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let rate = 1_234_567i128;
     let mut sources = Vec::new(&env);
@@ -156,7 +171,7 @@ fn test_update_rate_by_validator() {
     sources.push_back(1_235_000i128);
     sources.push_back(1_239_000i128);
 
-    client.update_rate(&validator, &ngn, &rate, &sources, &env.ledger().timestamp());
+    submit_quorum(&env, &client, &validators, &ngn, &rate, &sources);
 
     let stored_rate = client.get_rate(&ngn);
     assert_eq!(stored_rate, 1_235_000, "stored_rate should equal 1_235_000"); // median of sources
@@ -202,7 +217,6 @@ fn test_update_rate_with_insufficient_sources_fails() {
 fn test_update_rate_emits_event() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let rate = 1_234_567i128;
     let mut sources = Vec::new(&env);
@@ -210,7 +224,7 @@ fn test_update_rate_emits_event() {
     sources.push_back(1_235_000i128);
     sources.push_back(1_239_000i128);
 
-    client.update_rate(&validator, &ngn, &rate, &sources, &env.ledger().timestamp());
+    submit_quorum(&env, &client, &validators, &ngn, &rate, &sources);
 
     let events = env.events().all();
     let rate_update_event = events
@@ -222,10 +236,15 @@ fn test_update_rate_emits_event() {
         })
         .expect("rate_upd event not found");
 
+    // The event names the validator whose submission completed the quorum.
     let event_data: RateUpdateEvent = rate_update_event.2.into_val(&env);
     assert_eq!(event_data.currency, ngn, "event_data.currency should equal ngn");
     assert_eq!(event_data.rate, 1_235_000, "event_data.rate should equal 1_235_000");
-    assert_eq!(event_data.validator, validator, "event_data.validator should equal validator");
+    assert_eq!(
+        event_data.validator,
+        validators.get(1).unwrap(),
+        "event_data.validator should be the quorum-completing validator"
+    );
 }
 
 #[test]
@@ -241,7 +260,7 @@ fn test_update_rate_before_interval_fails() {
     sources.push_back(1_239_000i128);
 
     // First update
-    client.update_rate(&validator, &ngn, &rate, &sources, &env.ledger().timestamp());
+    submit_quorum(&env, &client, &validators, &ngn, &rate, &sources);
 
     // Try to update again immediately (before 6 hours)
     env.ledger().with_mut(|l| l.timestamp += 1000); // Only 1000 seconds later
@@ -255,7 +274,8 @@ fn test_update_rate_before_interval_fails() {
 fn test_update_rate_with_emergency_deviation_bypasses_interval() {
     // SC-025: A single validator can no longer unilaterally bypass the update interval.
     // The bypass now requires N-of-M (min_signatures) validators to first call
-    // cast_emergency_vote, and then any validator may call update_rate to commit.
+    // cast_emergency_vote, and then min_signatures validators submit via
+    // update_rate to commit (AC-003).
     // setup() initialises min_signatures = 2, so two validators must agree.
     let (env, client, _contract_id, _admin, validators) = setup();
 
@@ -269,13 +289,7 @@ fn test_update_rate_with_emergency_deviation_bypasses_interval() {
     sources.push_back(1_000_000i128);
 
     // Seed an initial rate.
-    client.update_rate(
-        &validator,
-        &ngn,
-        &initial_rate,
-        &sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &initial_rate, &sources);
 
     // Advance only 1000 seconds — well within the 6h update interval.
     env.ledger().with_mut(|l| l.timestamp += 1000);
@@ -290,13 +304,7 @@ fn test_update_rate_with_emergency_deviation_bypasses_interval() {
     client.cast_emergency_vote(&validator2, &ngn, &emergency_rate);
 
     // Step 2: Now consensus is met (2-of-3) — update_rate grants the bypass.
-    client.update_rate(
-        &validator,
-        &ngn,
-        &emergency_rate,
-        &emergency_sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &emergency_rate, &emergency_sources);
 
     let stored_rate = client.get_rate(&ngn);
     assert_eq!(stored_rate, 1_060_000, "stored_rate should equal 1_060_000 after 2-of-3 consensus");
@@ -310,7 +318,6 @@ fn test_update_rate_with_emergency_deviation_bypasses_interval() {
 fn test_outlier_detection_filters_bad_source() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let rate = 1_000_000i128;
     let mut sources = Vec::new(&env);
@@ -318,7 +325,7 @@ fn test_outlier_detection_filters_bad_source() {
     sources.push_back(1_005_000i128);
     sources.push_back(1_350_000i128); // Outlier
 
-    client.update_rate(&validator, &ngn, &rate, &sources, &env.ledger().timestamp());
+    submit_quorum(&env, &client, &validators, &ngn, &rate, &sources);
 
     // Stored rate should be median of clean sources only
     let stored_rate = client.get_rate(&ngn);
@@ -343,7 +350,6 @@ fn test_outlier_detection_filters_bad_source() {
 fn test_all_sources_outlier_uses_fallback() {
     let (env, client, _contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let rate = 1_000_000i128;
     let mut sources = Vec::new(&env);
@@ -351,7 +357,7 @@ fn test_all_sources_outlier_uses_fallback() {
     sources.push_back(2_000_000i128);
     sources.push_back(1_250_000i128);
 
-    client.update_rate(&validator, &ngn, &rate, &sources, &env.ledger().timestamp());
+    submit_quorum(&env, &client, &validators, &ngn, &rate, &sources);
 
     // Should not panic, should use fallback
     let stored_rate = client.get_rate(&ngn);
@@ -393,6 +399,51 @@ fn test_admin_set_rate_negative_fails() {
     let result = client.try_set_rate_admin(&ngn, &-100);
 
     assert!(result.is_err());
+}
+
+/// AC-013 (#736): once a rate exists, the admin override is subject to the
+/// update interval — a rewrite within 6h must fail even at small deviation.
+#[test]
+fn test_admin_set_rate_rejects_before_interval() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap (no prior rate)
+
+    // Still within the 6h interval — only 2% away, but too soon.
+    let result = client.try_set_rate_admin(&ngn, &1_020_000i128);
+    assert!(result.is_err(), "admin override before update interval must fail");
+}
+
+/// AC-013 (#736): even after the interval, a deviation beyond the
+/// per-currency emergency threshold (5%) is rejected with AdminDeviationTooLarge
+/// (#7026) — such moves require cast_emergency_vote + update_rate consensus.
+#[test]
+#[should_panic(expected = "#7026")]
+fn test_admin_set_rate_rejects_deviation_above_emergency_threshold() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap
+
+    env.ledger().with_mut(|l| l.timestamp += 21_601); // interval elapsed
+
+    client.set_rate_admin(&ngn, &1_100_000i128); // 10% > 5% threshold
+}
+
+/// AC-013 (#736): a within-threshold adjustment after the interval still works,
+/// so the override remains usable for small emergency corrections.
+#[test]
+fn test_admin_set_rate_within_threshold_after_interval_succeeds() {
+    let (env, client, _contract_id, _admin, _validators) = setup();
+
+    let ngn = CurrencyCode::new(&env, "NGN");
+    client.set_rate_admin(&ngn, &1_000_000i128); // bootstrap
+
+    env.ledger().with_mut(|l| l.timestamp += 21_601);
+
+    client.set_rate_admin(&ngn, &1_040_000i128); // 4% <= 5% threshold
+    assert_eq!(client.get_rate(&ngn), 1_040_000, "client.get_rate(&ngn) should equal 1_040_000");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -464,7 +515,6 @@ fn test_get_s_token_address_not_configured_fails() {
 fn test_get_acbu_usd_rate_basket_weighted() {
     let (env, client, _contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let kes = CurrencyCode::new(&env, "KES");
 
@@ -473,25 +523,13 @@ fn test_get_acbu_usd_rate_basket_weighted() {
     ngn_sources.push_back(1_000_000i128);
     ngn_sources.push_back(1_000_000i128);
     ngn_sources.push_back(1_000_000i128);
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &ngn_sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &ngn_sources);
 
     let mut kes_sources = Vec::new(&env);
     kes_sources.push_back(2_000_000i128);
     kes_sources.push_back(2_000_000i128);
     kes_sources.push_back(2_000_000i128);
-    client.update_rate(
-        &validator,
-        &kes,
-        &2_000_000i128,
-        &kes_sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &kes, &2_000_000i128, &kes_sources);
 
     // Basket is 50% NGN (1.0) + 50% KES (2.0) = 1.5
     let acbu_rate = client.get_acbu_usd_rate();
@@ -502,7 +540,6 @@ fn test_get_acbu_usd_rate_basket_weighted() {
 fn test_get_acbu_usd_rate_with_timestamp() {
     let (env, client, _contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let kes = CurrencyCode::new(&env, "KES");
 
@@ -510,31 +547,19 @@ fn test_get_acbu_usd_rate_with_timestamp() {
     ngn_sources.push_back(1_000_000i128);
     ngn_sources.push_back(1_000_000i128);
     ngn_sources.push_back(1_000_000i128);
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &ngn_sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &ngn_sources);
 
     let mut kes_sources = Vec::new(&env);
     kes_sources.push_back(2_000_000i128);
     kes_sources.push_back(2_000_000i128);
     kes_sources.push_back(2_000_000i128);
-    client.update_rate(
-        &validator,
-        &kes,
-        &2_000_000i128,
-        &kes_sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &kes, &2_000_000i128, &kes_sources);
 
     let (rate, timestamp) = client.get_acbu_usd_rate_with_timestamp();
-    // Weighted average: (1_000_000 * 5000 + 2_000_000 * 5000) / 10_000 / 10_000
-    // = (5_000_000_000 + 10_000_000_000) / 10_000 / 10_000
-    // = 15_000_000_000 / 100_000_000 = 150
-    assert_eq!(rate, 150, "rate should equal 150");
+    // 50% NGN (1.0) + 50% KES (2.0) = 1.5 USD in 7 decimals, identical to
+    // get_acbu_usd_rate (AC-001: previously under-reported as 150).
+    assert_eq!(rate, 1_500_000, "rate should equal 1_500_000");
+    assert_eq!(rate, client.get_acbu_usd_rate(), "both basket getters must agree");
     assert_eq!(timestamp, env.ledger().timestamp(), "timestamp should equal env.ledger().timestamp()");
 }
 
@@ -546,20 +571,13 @@ fn test_get_acbu_usd_rate_with_timestamp() {
 fn test_stale_rate_rejected() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut sources = Vec::new(&env);
     sources.push_back(1_000_000i128);
     sources.push_back(1_000_001i128);
     sources.push_back(999_999i128);
 
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &sources);
 
     // Advance past staleness threshold
     advance_ledger_to(&env, &contract_id, 100 + STALE_RATE_MAX_LEDGERS + 1);
@@ -572,20 +590,13 @@ fn test_stale_rate_rejected() {
 fn test_rate_at_staleness_boundary_accepted() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut sources = Vec::new(&env);
     sources.push_back(1_000_000i128);
     sources.push_back(1_000_001i128);
     sources.push_back(999_999i128);
 
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &sources);
 
     // Advance exactly to the boundary
     advance_ledger_to(&env, &contract_id, 100 + STALE_RATE_MAX_LEDGERS);
@@ -598,23 +609,18 @@ fn test_rate_at_staleness_boundary_accepted() {
 fn test_admin_override_refreshes_stale_rate() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut sources = Vec::new(&env);
     sources.push_back(1_000_000i128);
     sources.push_back(1_000_001i128);
     sources.push_back(999_999i128);
 
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &sources);
 
-    // Advance past staleness
+    // Advance past staleness, and past the update interval so the gated
+    // admin override (AC-013) is eligible to refresh the feed.
     advance_ledger_to(&env, &contract_id, 100 + STALE_RATE_MAX_LEDGERS + 1);
+    env.ledger().with_mut(|l| l.timestamp += 21_601);
 
     // Admin refreshes
     client.set_rate_admin(&ngn, &1_050_000i128);
@@ -628,20 +634,13 @@ fn test_admin_override_refreshes_stale_rate() {
 fn test_stale_basket_component_blocks_acbu_rate() {
     let (env, client, contract_id, _admin, validators) = setup();
 
-    let validator = validators.get(0).unwrap();
     let ngn = CurrencyCode::new(&env, "NGN");
     let mut sources = Vec::new(&env);
     sources.push_back(1_000_000i128);
     sources.push_back(1_000_001i128);
     sources.push_back(999_999i128);
 
-    client.update_rate(
-        &validator,
-        &ngn,
-        &1_000_000i128,
-        &sources,
-        &env.ledger().timestamp(),
-    );
+    submit_quorum(&env, &client, &validators, &ngn, &1_000_000i128, &sources);
 
     // Advance past staleness
     advance_ledger_to(&env, &contract_id, 100 + STALE_RATE_MAX_LEDGERS + 1);
@@ -682,7 +681,7 @@ fn test_accept_admin_before_timelock_fails() {
 
 #[test]
 fn test_accept_admin_after_timelock_succeeds() {
-    let (env, client, _contract_id, admin, _validators) = setup();
+    let (env, client, _contract_id, _admin, _validators) = setup();
 
     let new_admin = Address::generate(&env);
     client.transfer_admin(&new_admin);

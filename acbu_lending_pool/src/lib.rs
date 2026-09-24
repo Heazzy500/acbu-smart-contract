@@ -5,10 +5,12 @@ use soroban_sdk::{
     BytesN, Env,
 };
 
-use shared::{ContractPhase, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION, reentrancy_guard};
+use shared::{
+    reentrancy_guard, ContractPhase, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION,
+};
 
 #[contracttype]
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     AcbuToken,
@@ -96,6 +98,7 @@ pub struct LoanData {
 /// topic) so off-chain indexers can attribute a deposit to a specific user
 /// without having to parse the originating transaction envelope. See #369.
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DepositEvent {
     pub lender: Address,
     pub amount: i128,
@@ -103,6 +106,7 @@ pub struct DepositEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BorrowEvent {
     pub creator: Address,
     pub amount: i128,
@@ -112,6 +116,7 @@ pub struct BorrowEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RepayEvent {
     pub creator: Address,
     pub amount: i128,
@@ -121,6 +126,7 @@ pub struct RepayEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoanCreatedEvent {
     pub loan_id: u64,
     pub lender: Address,
@@ -132,6 +138,7 @@ pub struct LoanCreatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoanRepaidEvent {
     pub loan_id: u64,
     pub borrower: Address,
@@ -140,6 +147,7 @@ pub struct LoanRepaidEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
 pub struct RepaymentEvent {
     pub borrower: Address,
     pub amount: i128,
@@ -225,8 +233,12 @@ impl LendingPool {
         env.storage()
             .instance()
             .set(&DataKey::FeeRate, &fee_rate_bps);
-        env.storage().instance().set(&DataKey::Phase, &ContractPhase::Active);
-        env.storage().instance().set(&DataKey::ActiveLoansLiquidity, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::Phase, &ContractPhase::Active);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLoansLiquidity, &0i128);
         env.storage()
             .instance()
             .set(&SharedDataKey::Version, &VERSION);
@@ -265,9 +277,11 @@ impl LendingPool {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(lender.clone()), &new_balance);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Balance(lender.clone()), PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Balance(lender.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
@@ -309,13 +323,13 @@ impl LendingPool {
             .persistent()
             .get(&DataKey::Balance(lender.clone()))
             .unwrap_or(0);
-        
+
         let already_borrowed: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::Borrowed(lender.clone()))
             .unwrap_or(0);
-            
+
         let available_balance = current_balance.checked_sub(already_borrowed).unwrap_or(0);
         if available_balance < amount {
             env.panic_with_error(Error::InsufficientBalance);
@@ -335,9 +349,11 @@ impl LendingPool {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(lender.clone()), &new_balance);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Balance(lender.clone()), PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Balance(lender.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
@@ -419,21 +435,31 @@ impl LendingPool {
         }
 
         let loan_key = LoanId(borrower.clone(), loan_id);
-        if env.storage().persistent().has(&DataKey::Loan(loan_key.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Loan(loan_key.clone()))
+        {
             env.panic_with_error(Error::InvalidState);
         }
 
         let acbu_token: Address = env.storage().instance().get(&DataKey::AcbuToken).unwrap();
         let token = soroban_sdk::token::Client::new(&env, &acbu_token);
-        
+
         let contract_balance = token.balance(&env.current_contract_address());
         if contract_balance < amount {
             env.panic_with_error(Error::InsufficientBalance);
         }
 
         // CEI: Update state before external calls
-        let active_loans_liquidity: i128 = env.storage().instance().get(&DataKey::ActiveLoansLiquidity).unwrap_or(0);
-        env.storage().instance().set(&DataKey::ActiveLoansLiquidity, &(active_loans_liquidity + amount));
+        let active_loans_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLoansLiquidity)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLoansLiquidity, &(active_loans_liquidity + amount));
 
         let new_borrowed = already_borrowed
             .checked_add(amount)
@@ -467,19 +493,16 @@ impl LendingPool {
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan_key.clone()), &loan_data);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Loan(loan_key), PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Loan(loan_key),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
 
         let timestamp = env.ledger().timestamp();
-        let fee_rate: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRate)
-            .unwrap_or(0);
 
         env.events().publish(
             (symbol_short!("borrow"), borrower.clone()),
@@ -498,7 +521,7 @@ impl LendingPool {
                 lender,
                 borrower,
                 amount,
-                interest_bps: fee_rate,
+                interest_bps: fee_rate_bps,
                 term_seconds: LOAN_TERM_SECONDS,
                 timestamp,
             },
@@ -547,8 +570,12 @@ impl LendingPool {
     ///
     /// Requires `borrower`'s authorization and that the pool is not paused.
     /// `amount` is applied to accrued interest first, then principal, and may not
-    /// exceed the total amount due. When the principal reaches zero the loan is
-    /// marked [`LoanStatus::Repaid`]. Emits [`RepayEvent`], [`RepaymentEvent`]
+    /// exceed the total amount due. Repaid interest is credited to the lender's
+    /// tracked pool balance (AC-015 #738) — it stays in the contract as
+    /// withdrawable liquidity instead of being transferred to the lender's
+    /// wallet, keeping `Balance - Borrowed` in sync with the contract's token
+    /// holdings. When the principal reaches zero the loan is marked
+    /// [`LoanStatus::Repaid`]. Emits [`RepayEvent`], [`RepaymentEvent`]
     /// and [`LoanRepaidEvent`].
     pub fn repay(env: Env, borrower: Address, amount: i128, loan_id: u64) {
         // Re-entrancy guard
@@ -611,10 +638,29 @@ impl LendingPool {
 
         token.transfer(&borrower, &env.current_contract_address(), &amount);
 
+        // AC-015 (#738): credit repaid interest to the lender's tracked pool
+        // balance instead of transferring it straight to the lender's wallet.
+        // The tokens stay in the contract, so `Balance - Borrowed` continues to
+        // match actual holdings and the interest becomes withdrawable liquidity.
         let interest_repaid = amount - principal_repaid;
         if interest_repaid > 0 {
             let lender = loan_data.lender.clone();
-            token.transfer(&env.current_contract_address(), &lender, &interest_repaid);
+            let lender_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Balance(lender.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::Balance(lender.clone()),
+                &lender_balance
+                    .checked_add(interest_repaid)
+                    .unwrap_or_else(|| env.panic_with_error(Error::InvalidAmount)),
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Balance(lender.clone()),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_BUMP,
+            );
         }
 
         if loan_data.amount == 0 {
@@ -643,9 +689,11 @@ impl LendingPool {
                 .persistent()
                 .set(&DataKey::Loan(loan_key.clone()), &loan_data);
         }
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Loan(loan_key), PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Loan(loan_key),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
@@ -685,13 +733,17 @@ impl LendingPool {
     /// Pause the pool, disabling deposit/withdraw/borrow/repay. Admin only.
     pub fn pause(env: Env) {
         Self::check_admin(&env);
-        env.storage().instance().set(&DataKey::Phase, &ContractPhase::Paused);
+        env.storage()
+            .instance()
+            .set(&DataKey::Phase, &ContractPhase::Paused);
     }
 
     /// Unpause the pool, re-enabling state-changing operations. Admin only.
     pub fn unpause(env: Env) {
         Self::check_admin(&env);
-        env.storage().instance().set(&DataKey::Phase, &ContractPhase::Active);
+        env.storage()
+            .instance()
+            .set(&DataKey::Phase, &ContractPhase::Active);
     }
 
     /// Stage a WASM upgrade to `new_wasm_hash`/`new_version` and start the upgrade
@@ -796,10 +848,7 @@ impl LendingPool {
 
     /// Returns the current annualized loan interest rate in basis points.
     pub fn get_interest_rate(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeRate)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0)
     }
 
     /// Update the annualized loan interest rate in basis points.
@@ -819,20 +868,14 @@ impl LendingPool {
             env.panic_with_error(Error::InvalidAmount);
         }
 
-        let old_rate: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRate)
-            .unwrap_or(0);
+        let old_rate: i128 = env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0);
 
         env.storage()
             .instance()
             .set(&DataKey::FeeRate, &new_rate_bps);
 
-        env.events().publish(
-            (symbol_short!("rate_set"),),
-            (old_rate, new_rate_bps),
-        );
+        env.events()
+            .publish((symbol_short!("rate_set"),), (old_rate, new_rate_bps));
     }
 
     // -----------------------------------------------------------------------
@@ -855,10 +898,8 @@ impl LendingPool {
             .instance()
             .set(&DataKey::PendingAdminEligibleAt, &eligible_at);
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        env.events().publish(
-            (symbol_short!("adm_init"),),
-            (current_admin, new_admin, eligible_at),
-        );
+        env.events()
+            .publish((symbol_short!("adm_init"),), (current_admin, new_admin, eligible_at));
     }
 
     /// Step 2 — the nominated address claims ownership after the timelock.
@@ -880,7 +921,9 @@ impl LendingPool {
         }
 
         let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        env.storage().instance().set(&DataKey::Admin, &pending_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &pending_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage()
             .instance()
@@ -923,7 +966,9 @@ impl LendingPool {
 
     /// Timestamp after which `accept_admin` becomes callable.
     pub fn get_pending_admin_eligible_at(env: Env) -> Option<u64> {
-        env.storage().instance().get(&DataKey::PendingAdminEligibleAt)
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdminEligibleAt)
     }
 
     fn check_admin(env: &Env) {
@@ -958,7 +1003,8 @@ impl LendingPool {
             return 0;
         }
 
-        let divisor = BASIS_POINTS.checked_mul(SECONDS_PER_YEAR)
+        let divisor = BASIS_POINTS
+            .checked_mul(SECONDS_PER_YEAR)
             .unwrap_or_else(|| env.panic_with_error(Error::InvalidAmount));
 
         if divisor == 0 {

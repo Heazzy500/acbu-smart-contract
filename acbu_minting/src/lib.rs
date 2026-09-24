@@ -18,7 +18,7 @@ use shared::{
 pub mod token_contract {
     soroban_sdk::contractimport!(
         file = "../soroban_token_contract.wasm",
-        sha256 = "8331ad752af7ff986f2b9497ac7383c57020bfc80ba19541f4142fc94d1348c1"
+        sha256 = "6b14997b915dee21082884cd5a2f1f2f0aef0073d1dcb9c5b3c674cf487fb41d"
     );
 }
 
@@ -125,6 +125,7 @@ pub enum MintingError {
     InvalidRecipient = 5023,
     InvalidRoleSeparation = 5024,
     SupplyMismatch = 5025,
+    NegativeSupply = 5027,
     /// The computed ACBU output is below the caller-supplied `min_acbu_out`
     /// floor, indicating that same-block oracle movement would cause unacceptable
     /// slippage. The transaction should be retried with updated parameters.
@@ -135,33 +136,34 @@ pub enum MintingError {
 impl Display for MintingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::AlreadyInitialized => "Minting contract already initialized",
-            Self::InvalidFeeRate => "Invalid fee rate",
-            Self::InvalidMintAmount => "Invalid mint amount",
-            Self::InsufficientReserves => "Insufficient reserves",
-            Self::ProofAlreadyUsed => "Proof already used",
-            Self::InvalidOracleRate => "Invalid oracle rate",
-            Self::UnauthorizedOperator => "Unauthorized operator",
-            Self::DuplicateFintechTxId => "Duplicate fintech transaction ID",
-            Self::InvalidDripAmount => "Invalid drip amount",
-            Self::DripExceedsCap => "Drip exceeds cap",
-            Self::InsufficientDemoCustody => "Insufficient demo custody",
-            Self::Paused => "Minting contract is paused",
-            Self::OracleStale => "Oracle rate is stale",
-            Self::FintechTxIdEmpty => "Fintech transaction ID is empty",
-            Self::FintechTxIdTooShort => "Fintech transaction ID is too short",
-            Self::FintechTxIdTooLong => "Fintech transaction ID is too long",
-            Self::FintechTxIdInvalidChar => "Fintech transaction ID contains invalid characters",
-            Self::InvalidVersion => "Invalid contract version",
-            Self::MaxSupplyExceeded => "Maximum supply exceeded",
-            Self::NoPendingAdmin => "No pending admin",
-            Self::AdminTimelockNotElapsed => "Admin timelock has not elapsed",
-            Self::NoPendingAdminToCancel => "No pending admin to cancel",
-            Self::InvalidRecipient => "Invalid recipient",
-            Self::InvalidRoleSeparation => "Admin and operator must be different addresses",
-            Self::SupplyMismatch => "Supplied value does not match on-chain supply",
-            Self::SlippageExceeded => "Output below minimum: slippage exceeded",
-            Self::Unknown => "Unknown minting error",
+            Self::AlreadyInitialized => "minting contract already initialized",
+            Self::InvalidFeeRate => "invalid fee rate",
+            Self::InvalidMintAmount => "invalid mint amount",
+            Self::InsufficientReserves => "insufficient reserves",
+            Self::ProofAlreadyUsed => "proof already used",
+            Self::InvalidOracleRate => "invalid oracle rate",
+            Self::UnauthorizedOperator => "unauthorized operator",
+            Self::DuplicateFintechTxId => "duplicate fintech transaction id",
+            Self::InvalidDripAmount => "invalid drip amount",
+            Self::DripExceedsCap => "drip exceeds cap",
+            Self::InsufficientDemoCustody => "insufficient demo custody",
+            Self::Paused => "minting contract is paused",
+            Self::OracleStale => "oracle rate is stale",
+            Self::FintechTxIdEmpty => "fintech transaction id is empty",
+            Self::FintechTxIdTooShort => "fintech transaction id is too short",
+            Self::FintechTxIdTooLong => "fintech transaction id is too long",
+            Self::FintechTxIdInvalidChar => "fintech transaction id contains invalid characters",
+            Self::InvalidVersion => "invalid contract version",
+            Self::MaxSupplyExceeded => "maximum supply exceeded",
+            Self::NoPendingAdmin => "no pending admin",
+            Self::AdminTimelockNotElapsed => "admin timelock has not elapsed",
+            Self::NoPendingAdminToCancel => "no pending admin to cancel",
+            Self::InvalidRecipient => "invalid recipient",
+            Self::InvalidRoleSeparation => "admin and operator must be different addresses",
+            Self::SupplyMismatch => "supplied value does not match on-chain supply",
+            Self::SlippageExceeded => "output below minimum: slippage exceeded",
+            Self::NegativeSupply => "negative supply",
+            Self::Unknown => "unknown minting error",
         };
         f.write_str(message)
     }
@@ -309,7 +311,7 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
@@ -429,7 +431,7 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
 
         if !check_proof_unused(&env, &proof_id) {
             env.panic_with_error(MintingError::ProofAlreadyUsed);
@@ -606,7 +608,7 @@ impl MintingContract {
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
@@ -744,7 +746,7 @@ impl MintingContract {
         operator.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         if !check_proof_unused(&env, &proof_id) {
@@ -889,7 +891,7 @@ impl MintingContract {
 
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
 
         // C-039: Strict input validation — enforce length bounds and charset
         // before touching any storage, so garbage IDs are rejected cheaply.
@@ -897,14 +899,8 @@ impl MintingContract {
         let normalized_tx_id = normalize_fintech_tx_id(&env, &fintech_tx_id);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
-        // Check if fintech_tx_id has already been processed
-        let mut processed_ids: soroban_sdk::Map<SorobanString, bool> = env
-            .storage()
-            .instance()
-            .get(&DATA_KEY.processed_fintech_tx_ids)
-            .unwrap_or_else(|| soroban_sdk::map![&env]);
-
-        if processed_ids.contains_key(normalized_tx_id.clone()) {
+        // AC-024: Check if fintech_tx_id has already been processed in persistent storage
+        if is_fintech_tx_id_processed(&env, &normalized_tx_id) {
             env.panic_with_error(MintingError::DuplicateFintechTxId);
         }
 
@@ -977,8 +973,17 @@ impl MintingContract {
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        // AC-009 (#732): the treasury fee is minted as new ACBU below, so it
+        // must count toward both the supply-cap/reserve projection and the
+        // tracked total supply — otherwise `get_total_supply()` drifts below
+        // the real circulating supply after every fee-bearing fiat mint.
+        let fee = calculate_fee(usd_gross, fee_rate);
+        let minted_total = acbu_amount
+            .checked_add(fee)
+            .expect("Overflow in minted amount calculation");
+
         let projected_supply = total_supply
-            .checked_add(acbu_amount)
+            .checked_add(minted_total)
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -993,7 +998,7 @@ impl MintingContract {
         // For mint_from_fiat, fiat deposit is handled off-chain by the fintech partner.
         // No on-chain token transfer needed; fintech validates and deposits fiat in their system.
 
-        total_supply += acbu_amount;
+        total_supply += minted_total;
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -1001,16 +1006,12 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_rate);
         if fee > 0 {
             acbu_sac.mint(&treasury, &fee);
         }
 
-        // Mark fintech_tx_id as processed to prevent duplicate minting
-        processed_ids.set(normalized_tx_id.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DATA_KEY.processed_fintech_tx_ids, &processed_ids);
+        // AC-024: Mark fintech_tx_id as processed in persistent storage with TTL to prevent unbounded instance-storage growth
+        mark_fintech_tx_id_processed(&env, &normalized_tx_id);
 
         let mint_event = MintEvent {
             transaction_id: normalized_tx_id,
@@ -1053,7 +1054,7 @@ impl MintingContract {
         admin.require_auth();
 
         // C-058: reject contract-type recipients to prevent stranded token transfers.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         if amount <= 0 {
             env.panic_with_error(MintingError::InvalidDripAmount);
         }
@@ -1516,12 +1517,30 @@ impl MintingContract {
         env.storage().instance().get(&DATA_KEY.admin).unwrap()
     }
 
-    /// Check if the contract has been initialized.
+/// Check if the contract has been initialized.
     ///
     /// Backend services can call this before invoking other functions to avoid
     /// cryptic storage-not-found errors from uninitialized contracts.
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&SharedDataKey::Version)
+    }
+
+    fn check_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+    }
+
+    fn assert_recipient_is_account(address: &Address) {
+        let env = address.env();
+        let strkey = address.to_string();
+        if strkey.len() != 56 {
+            env.panic_with_error(MintingError::InvalidRecipient);
+        }
+        let mut buf = [0u8; 56];
+        strkey.copy_into_slice(&mut buf);
+        if buf[0] != b'G' {
+            env.panic_with_error(MintingError::InvalidRecipient);
+        }
     }
 
     /// Pending successor, if a transfer is in progress.
@@ -1644,31 +1663,6 @@ fn next_tx_nonce(env: &Env) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: assert that an address belongs to an account (not a contract).
-// C-058 — minting to a contract address that has no token-receipt logic would
-// permanently strand funds.
-//
-// soroban-sdk 21 does not expose an `is_account()` predicate on `Address`, but
-// the strkey encoding returned by `Address::to_string()` reveals the address
-// kind: standard Stellar account (ed25519 public key) strkeys start with 'G',
-// while contract strkeys start with 'C'. Both encodings are 56 characters
-// long, so any address that doesn't decode to a 56-byte 'G...' string is
-// rejected.
-// ---------------------------------------------------------------------------
-fn assert_recipient_is_account(address: &Address) {
-    let env = address.env();
-    let strkey = address.to_string();
-    if strkey.len() != 56 {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
-    let mut buf = [0u8; 56];
-    strkey.copy_into_slice(&mut buf);
-    if buf[0] != b'G' {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Proof-replay helpers: used by mint_from_demo_fiat to prevent double-spend.
 // ---------------------------------------------------------------------------
 fn check_proof_unused(env: &Env, proof_id: &SorobanString) -> bool {
@@ -1681,6 +1675,21 @@ fn mark_proof_used(env: &Env, proof_id: &SorobanString) {
     env.storage()
         .persistent()
         .set(&(DATA_KEY.proof_prefix, proof_id.clone()), &true);
+}
+
+// ---------------------------------------------------------------------------
+// AC-024: Fintech tx ID deduplication helpers: prevent double-spend in mint_from_fiat.
+// Uses per-key persistent storage instead of growing an unbounded Map in instance storage.
+// ---------------------------------------------------------------------------
+fn is_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) -> bool {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().has(&key)
+}
+
+fn mark_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(&key, 5184000, 5184000);
 }
 
 // ---------------------------------------------------------------------------

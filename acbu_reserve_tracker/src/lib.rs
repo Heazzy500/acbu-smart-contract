@@ -1,8 +1,8 @@
 #![no_std]
 use core::fmt::{self, Display};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, vec, Address,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 use shared::{
@@ -25,9 +25,9 @@ pub enum ReserveTrackerError {
     InvalidMerkleProof = 8009,
     InvalidCustodian = 8010,
     AttestationExpired = 8011,
-    NonPositiveAmount = 8008,
-    InconsistentReserve = 8009,
-    DuplicateCurrency = 8010,
+    NonPositiveAmount = 8014,
+    InconsistentReserve = 8015,
+    DuplicateCurrency = 8016,
     NoPendingUpgrade = 8012,
     TimelockNotElapsed = 8013,
     Unknown = 8999,
@@ -75,8 +75,22 @@ pub struct DataKey {
     pub pending_upgrade_wasm: Symbol,
     pub pending_upgrade_version: Symbol,
     pub pending_upgrade_eligible_at: Symbol,
+    pub custodian: Symbol,
     pub attested_root: Symbol,
     pub attestation_ts: Symbol,
+}
+
+/// A single reserve entry committed in the Merkle attestation tree.
+///
+/// Each leaf encodes the currency code, the reserve amount, its USD value,
+/// and the timestamp at which the custodian attested to the balance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationLeaf {
+    pub currency: CurrencyCode,
+    pub amount: i128,
+    pub value_usd: i128,
+    pub timestamp: u64,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -94,9 +108,20 @@ const DATA_KEY: DataKey = DataKey {
     pending_upgrade_wasm: symbol_short!("PU_WASM"),
     pending_upgrade_version: symbol_short!("PU_VER"),
     pending_upgrade_eligible_at: symbol_short!("PU_ETA"),
-    attested_root: symbol_short!("ATTS_RT"),
-    attestation_ts: symbol_short!("ATTS_TS"),
+    custodian: symbol_short!("CUSTODIN"),
+    attested_root: symbol_short!("ATT_ROOT"),
+    attestation_ts: symbol_short!("ATT_TS"),
 };
+
+/// A single currency attestation entry in a Merkle tree, submitted by the custodian.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationLeaf {
+    pub currency: CurrencyCode,
+    pub amount: i128,
+    pub value_usd: i128,
+    pub timestamp: u64,
+}
 
 /// Admin rotation timelock: the pending admin must wait this long before
 /// claiming ownership, giving the current admin a window to cancel a mistaken
@@ -178,7 +203,11 @@ impl ReserveTrackerContract {
         let last_call: Option<u64> = env.storage().instance().get(&DATA_KEY.last_verify_call);
         if let Some(last) = last_call {
             if now.saturating_sub(last) < VERIFY_RESERVES_COOLDOWN_SECONDS {
-                return true;
+                if let Some(cached): Option<bool> =
+                    env.storage().instance().get(&DATA_KEY.last_verify_result)
+                {
+                    return cached;
+                }
             }
         }
 
@@ -308,10 +337,12 @@ impl ReserveTrackerContract {
             Vec::new(&env),
         );
 
+        // Supply and rate are both 7-decimal, so divide by DECIMALS once to get
+        // a 7-decimal USD value comparable to `value_usd` (AC-002).
         let total_acbu_usd = total_acbu_supply
             .checked_mul(acbu_usd_rate)
             .expect("Overflow in ACBU USD calculation")
-            .checked_div(100_000_000)
+            .checked_div(DECIMALS)
             .expect("Division by zero in ACBU USD calculation");
         if total_acbu_usd == 0 {
             return true;
@@ -439,7 +470,10 @@ impl ReserveTrackerContract {
     fn hash_leaf(env: &Env, leaf: &AttestationLeaf) -> BytesN<32> {
         let mut buf = Bytes::new(env);
         let code = leaf.currency.code();
-        let code_bytes = code.to_bytes();
+        let mut code_buf = [0u8; 32];
+        code.copy_into_slice(&mut code_buf);
+        let code_len = code.len() as usize;
+        let code_bytes = Bytes::from_slice(env, &code_buf[..code_len]);
         buf.append(&code_bytes);
         let amt_bytes = Bytes::from_slice(env, &leaf.amount.to_be_bytes()[..]);
         buf.append(&amt_bytes);
@@ -447,7 +481,7 @@ impl ReserveTrackerContract {
         buf.append(&val_bytes);
         let ts_bytes = Bytes::from_slice(env, &leaf.timestamp.to_be_bytes()[..]);
         buf.append(&ts_bytes);
-        env.crypto().keccak256(&buf).to_bytes()
+        env.crypto().keccak256(&buf).into()
     }
 
     /// Walk up the Merkle tree from `leaf_hash` using `proof` and `index`.
@@ -470,7 +504,7 @@ impl ReserveTrackerContract {
                 combined.append(&sib_bytes);
                 combined.append(&cur_bytes);
             }
-            current = env.crypto().keccak256(&combined).to_bytes();
+            current = env.crypto().keccak256(&combined).into();
         }
         current
     }

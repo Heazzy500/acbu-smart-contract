@@ -1,12 +1,16 @@
 #![cfg(test)]
 
 use acbu_minting::{MintingContract, MintingContractClient};
-use shared::{CurrencyCode, MintEvent, DECIMALS};
-use soroban_sdk::{
-    contract, contractimpl, symbol_short,
-    testutils::{Address as _, Events},
-    Address, Env, FromVal, IntoVal, String as SorobanString, Symbol, Vec,
+use shared::{CurrencyCode, DECIMALS};
+use soroban_env_host::budget::AsBudget;
+use soroban_sdk::testutils::StellarAssetContract;
+use soroban_sdk::xdr::{
+    AlphaNum4, AssetCode4, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
+    LedgerKeyTrustLine, ScAddress, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
+    TrustLineFlags,
 };
+use soroban_sdk::{testutils::Address as _, Address, Env, String as SorobanString};
+use std::rc::Rc;
 
 // --- Mocks (reuse from test.rs) ---
 
@@ -93,15 +97,17 @@ fn setup_test(
     let reserve_tracker = env.register_contract(None, reserve_mock::MockReserveTracker);
 
     let contract_id = env.register_contract(None, MintingContract);
-    let acbu_token = env
-        .register_stellar_asset_contract_v2(contract_id.clone())
-        .address();
+    let acbu_sac = env.register_stellar_asset_contract_v2(contract_id.clone());
+    let acbu_token = acbu_sac.address();
 
     let usdc_token = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
 
     let client = MintingContractClient::new(env, &contract_id);
+
+    // C-058 recipients are ed25519 accounts; SAC mint needs their trustline.
+    establish_trustline(env, &account(env), &acbu_sac);
 
     (
         admin,
@@ -113,8 +119,47 @@ fn setup_test(
     )
 }
 
+/// C-058 requires ed25519-account recipients, but the SAC rejects mints to
+/// accounts without a trustline (host `TrustlineMissingError`). Test-only:
+/// create the trustline directly in host storage.
+fn establish_trustline(env: &Env, holder: &Address, sac: &StellarAssetContract) {
+    let holder_account = match ScAddress::from(holder.clone()) {
+        ScAddress::Account(id) => id,
+        _ => panic!("holder must be an account address"),
+    };
+    let issuer_account = match ScAddress::from(sac.issuer().address()) {
+        ScAddress::Account(id) => id,
+        _ => panic!("issuer must be an account address"),
+    };
+    let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'a', b'a', b'a', 0]),
+        issuer: issuer_account,
+    });
+    let key = Rc::new(LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: holder_account.clone(),
+        asset: asset.clone(),
+    }));
+    let entry = Rc::new(LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Trustline(TrustLineEntry {
+            account_id: holder_account,
+            asset,
+            balance: 0,
+            limit: i64::MAX,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    });
+    env.host()
+        .with_mut_storage(|storage| {
+            storage.put(&key, &entry, None, AsBudget::as_budget(env.host()))
+        })
+        .unwrap();
+}
+
 fn init_mint_client(
-    _env: &Env,
+    env: &Env,
     client: &MintingContractClient,
     admin: &Address,
     oracle: &Address,
@@ -136,12 +181,23 @@ fn init_mint_client(
         treasury: treasury.clone(),
         fee_rate_bps: fee_rate,
         fee_single_bps: fee_single,
-        operator: admin.clone(),
+        // initialize rejects admin == operator (#5024); every test calls
+        // set_operator right after init, so a placeholder is sufficient.
+        operator: Address::generate(env),
     };
     client.initialize(&config);
 }
 
 // --- Tests for mint_from_fiat: Access Control and Validation ---
+
+/// C-058 requires recipients to be ed25519 accounts (`G...`), but
+/// `Address::generate` yields contract addresses (`C...`) in SDK 21.
+fn account(env: &Env) -> Address {
+    Address::from_string(&SorobanString::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
+}
 
 #[test]
 fn test_mint_from_fiat_success() {
@@ -150,7 +206,7 @@ fn test_mint_from_fiat_success() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -189,11 +245,23 @@ fn test_mint_from_fiat_success() {
     assert!(acbu > 0);
     let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token_id);
     assert_eq!(acbu_client.balance(&recipient), acbu, "acbu_client.balance(&recipient) should equal acbu");
-    assert_eq!(client.get_total_supply(), acbu, "client.get_total_supply() should equal acbu");
+    // AC-009 (#732): total supply must include the treasury fee mint.
+    let expected_fee = shared::calculate_fee(50 * DECIMALS, 50);
+    assert!(expected_fee > 0, "fee must be positive for this scenario");
+    assert_eq!(
+        client.get_total_supply(),
+        acbu + expected_fee,
+        "client.get_total_supply() should include the treasury fee mint"
+    );
+    // The treasury received the fee as newly minted ACBU.
+    assert_eq!(
+        acbu_client.balance(&admin),
+        expected_fee,
+        "acbu_client.balance(&admin) should equal expected_fee"
+    );
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized operator")]
 #[should_panic(expected = "#5007")]
 fn test_mint_from_fiat_unauthorized_caller() {
     let env = Env::default();
@@ -201,7 +269,7 @@ fn test_mint_from_fiat_unauthorized_caller() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let attacker = Address::generate(&env);
     let mint_addr = client.address.clone();
 
@@ -242,7 +310,6 @@ fn test_mint_from_fiat_unauthorized_caller() {
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized operator")]
 #[should_panic(expected = "#5007")]
 fn test_mint_from_fiat_recipient_self_mint() {
     let env = Env::default();
@@ -250,7 +317,7 @@ fn test_mint_from_fiat_recipient_self_mint() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -297,7 +364,7 @@ fn test_mint_from_fiat_empty_tx_id() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -337,7 +404,6 @@ fn test_mint_from_fiat_empty_tx_id() {
 }
 
 #[test]
-#[should_panic(expected = "Fiat transaction already processed")]
 #[should_panic(expected = "#5008")]
 fn test_mint_from_fiat_duplicate_tx_id() {
     let env = Env::default();
@@ -345,7 +411,7 @@ fn test_mint_from_fiat_duplicate_tx_id() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -401,7 +467,7 @@ fn test_mint_from_fiat_below_min_amount() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -448,7 +514,7 @@ fn test_mint_from_fiat_above_max_amount() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -494,7 +560,7 @@ fn test_mint_from_fiat_admin_not_default_operator() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
@@ -536,7 +602,6 @@ fn test_mint_from_fiat_admin_not_default_operator() {
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized operator")]
 #[should_panic(expected = "#5007")]
 fn test_mint_from_fiat_admin_when_operator_set() {
     let env = Env::default();
@@ -544,7 +609,7 @@ fn test_mint_from_fiat_admin_when_operator_set() {
 
     let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
     let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient = account(&env);
     let mint_addr = client.address.clone();
 
     let stoken_id = env
