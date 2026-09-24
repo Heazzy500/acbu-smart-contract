@@ -55,7 +55,7 @@ pub struct AdminProposal {
 
 /// Multisig configuration stored inside the multisig contract.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultisigConfig {
     /// Ordered list of authorised signers.
     pub signers: Vec<Address>,

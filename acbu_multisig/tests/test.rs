@@ -312,7 +312,9 @@ fn test_execute_after_signer_removed_panics() {
     new_signers.push_back(signers[1].clone());
     new_signers.push_back(signers[2].clone());
     new_signers.push_back(Address::generate(&env));
-    client.update_config(&new_signers, &2);
+    let rotate = client.propose_update_config(&signers[1], &new_signers, &2);
+    client.approve(&signers[2], &rotate);
+    client.execute(&signers[2], &rotate);
 
     // signers[0] approved but is no longer a signer — execute must panic.
     client.execute(&signers[2], &pid);
@@ -393,16 +395,18 @@ fn test_threshold_increase_requires_more_approvals() {
     for i in 0..5 {
         same_signers.push_back(signers[i].clone());
     }
-    client.update_config(&same_signers, &4);
-    
+    let raise = client.propose_update_config(&signers[2], &same_signers, &4);
+    client.approve(&signers[3], &raise);
+    client.execute(&signers[3], &raise);
+
     // Verify config updated
     let cfg = client.get_config();
     assert_eq!(cfg.threshold, 4, "Threshold should be updated to 4");
-    
+
     // With only 2 approvals and new threshold of 4, execution should fail
     // (This test verifies the threshold is enforced after config changes)
-    let result = std::panic::catch_unwind(|| {
-        client.execute(&signers[2], &pid);
-    });
-    assert!(result.is_err(), "Execute should panic when approvals are below new threshold");
+    assert!(
+        client.try_execute(&signers[2], &pid).is_err(),
+        "Execute should fail when approvals are below new threshold"
+    );
 }
