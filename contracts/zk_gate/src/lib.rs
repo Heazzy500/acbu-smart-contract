@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
-    Symbol, Vec,
+    Vec,
 };
 
 #[contracterror]
@@ -75,13 +75,9 @@ impl ZkGate {
         verified
     }
 
-    fn require_contract_vrf(env: &Env, vrf: &Address) {
-        if *vrf == env.current_contract_address() {
-            env.panic_with_error(ZkGateError::InvalidVrf);
+    fn require_contract_vrf(_env: &Env, vrf: &Address) {
+        if *vrf == _env.current_contract_address() {
+            _env.panic_with_error(ZkGateError::InvalidVrf);
         }
-
-        // Reject non-contract verifier entries up front, because wallet addresses do not
-        // expose the `is_v` entrypoint the gate expects to call.
-        let _ = vrf.contract_id();
     }
 }

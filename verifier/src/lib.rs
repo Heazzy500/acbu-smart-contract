@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn tier_zero_always_blocked() {
         assert_eq!(
-            check_rate_gate(KycTier::Zero, CC_NG, 0, 1 * DECIMALS).unwrap_err(),
+            check_rate_gate(KycTier::Zero, CC_NG, 0, DECIMALS).unwrap_err(),
             VerifierError::KycBlocked
         );
     }

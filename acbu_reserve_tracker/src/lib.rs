@@ -134,6 +134,17 @@ const VERIFY_RESERVES_COOLDOWN_SECONDS: u64 = 60;
 /// this window. 24 hours.
 const ATTESTATION_MAX_AGE_SECONDS: u64 = 86_400;
 
+/// Allowed deviation between the admin-reported `value_usd` and the value
+/// derived from `amount * oracle_rate`, expressed in basis points of the
+/// derived value.  10 bps = 0.1 %.
+const RESERVE_TOLERANCE_BPS: i128 = 10;
+
+/// Minimum tolerance in 7-decimal stroops (AC-040).  `DECIMALS / 100` is
+/// 0.01 USD worth of slop, which absorbs integer-division rounding errors
+/// without allowing meaningful reserve inflation.  Without this floor the
+/// percentage-based tolerance collapses to zero for tiny reserve entries.
+const RESERVE_MIN_TOLERANCE_STROOPS: i128 = DECIMALS / 100;
+
 contractmeta!(key = "version", val = "1");
 
 #[contract]
@@ -220,7 +231,7 @@ impl ReserveTrackerContract {
     /// Like [`Self::verify_reserves`] but uses the caller-supplied
     /// `total_acbu_supply` instead of querying the token contract. Returns `true`
     /// if reserves meet the minimum ratio.
-    fn verify_reserves_manual(env: Env, total_acbu_supply: i128) -> bool {
+    pub fn verify_reserves_manual(env: Env, total_acbu_supply: i128) -> bool {
         Self::is_reserve_sufficient(env, total_acbu_supply)
     }
 
@@ -258,8 +269,13 @@ impl ReserveTrackerContract {
             .and_then(|v| v.checked_div(DECIMALS))
             .expect("Overflow in reserve value calculation");
 
+        let tolerance: u128 = expected_value_usd
+            .checked_mul(RESERVE_TOLERANCE_BPS)
+            .and_then(|v| v.checked_div(BASIS_POINTS))
+            .expect("Overflow in tolerance calculation")
+            .max(RESERVE_MIN_TOLERANCE_STROOPS) as u128;
         let diff = value_usd.abs_diff(expected_value_usd);
-        if diff > 1 {
+        if diff > tolerance {
             env.panic_with_error(ReserveTrackerError::InconsistentReserve);
         }
 
