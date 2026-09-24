@@ -242,7 +242,7 @@ impl LendingPool {
     /// pool balance. `amount` must be positive. Emits a [`DepositEvent`].
     pub fn deposit(env: Env, lender: Address, amount: i128) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         lender.require_auth();
         Self::check_paused(&env);
@@ -285,7 +285,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Withdraw `amount` of ACBU from the caller's pool balance.
@@ -296,7 +295,7 @@ impl LendingPool {
     /// least [`MIN_POOL_BALANCE`]; otherwise it fails with [`Error::DustBalance`].
     pub fn withdraw(env: Env, lender: Address, amount: i128) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         lender.require_auth();
         Self::check_paused(&env);
@@ -351,7 +350,6 @@ impl LendingPool {
             .publish((symbol_short!("withdraw"), lender), amount);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Borrow `amount` of ACBU from a specific `lender`'s liquidity, creating
@@ -393,7 +391,7 @@ impl LendingPool {
         loan_id: u64,
     ) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         borrower.require_auth();
         // The loan is unsecured (see the function docs), so the lender bears the
@@ -507,7 +505,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Return the loan identified by `(borrower, loan_id)`, or `None` if it does
@@ -555,7 +552,7 @@ impl LendingPool {
     /// and [`LoanRepaidEvent`].
     pub fn repay(env: Env, borrower: Address, amount: i128, loan_id: u64) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         borrower.require_auth();
         Self::check_paused(&env);
@@ -683,7 +680,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Pause the pool, disabling deposit/withdraw/borrow/repay. Admin only.
