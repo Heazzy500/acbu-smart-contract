@@ -16,11 +16,18 @@ pub enum DataKey {
     AcbuToken,
     FeeRate,
     Phase,
+    /// Lender's gross pool balance: deposits plus credited interest minus
+    /// withdrawals. Lent-out principal is *not* subtracted here (AC-041); it is
+    /// tracked separately in `Borrowed`, so the lender's available liquidity is
+    /// `Balance - Borrowed`.
     Balance(Address),
     Borrowed(Address), // Tracks total amount borrowed from each lender
     Loan(LoanId),
-    ActiveLoansLiquidity, // Tracks total amount currently loaned out
-    LenderBalances,
+    ActiveLoansLiquidity, // Tracks total amount currently loaned out (sum of Borrowed)
+    /// Sum of every lender's `Balance` (AC-041). Together with
+    /// `ActiveLoansLiquidity` this makes the pool invariant
+    /// `TotalLenderBalance - ActiveLoansLiquidity == SAC balance` checkable.
+    TotalLenderBalance,
     PendingUpgradeWasm,
     PendingUpgradeVersion,
     PendingUpgradeEligibleAt,
@@ -241,6 +248,9 @@ impl LendingPool {
             .set(&DataKey::ActiveLoansLiquidity, &0i128);
         env.storage()
             .instance()
+            .set(&DataKey::TotalLenderBalance, &0i128);
+        env.storage()
+            .instance()
             .set(&SharedDataKey::Version, &VERSION);
         env.storage()
             .instance()
@@ -282,6 +292,7 @@ impl LendingPool {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_BUMP,
         );
+        Self::adjust_total_lender_balance(&env, amount);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
@@ -471,6 +482,9 @@ impl LendingPool {
             .instance()
             .set(&DataKey::ActiveLoansLiquidity, &(active_loans_liquidity + amount));
 
+        // AC-041: the lender's `Balance` is intentionally left unchanged — it is
+        // their gross claim on the pool. Lent-out principal is recorded in
+        // `Borrowed`, and only `Balance - Borrowed` is lendable/withdrawable.
         let new_borrowed = already_borrowed
             .checked_add(amount)
             .unwrap_or_else(|| env.panic_with_error(Error::InvalidAmount));
@@ -672,6 +686,7 @@ impl LendingPool {
                 PERSISTENT_TTL_THRESHOLD,
                 PERSISTENT_TTL_BUMP,
             );
+            Self::adjust_total_lender_balance(&env, interest_repaid);
         }
 
         if loan_data.amount == 0 {
@@ -858,6 +873,38 @@ impl LendingPool {
             .unwrap_or(0)
     }
 
+    /// Return the principal currently lent out from `lender`'s balance, or `0`.
+    pub fn get_borrowed(env: Env, lender: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Borrowed(lender))
+            .unwrap_or(0)
+    }
+
+    /// Return the portion of `lender`'s balance that is not lent out and can be
+    /// withdrawn or lent (`Balance - Borrowed`, floored at `0`).
+    pub fn get_available_balance(env: Env, lender: Address) -> i128 {
+        let balance = Self::get_balance(env.clone(), lender.clone());
+        let borrowed = Self::get_borrowed(env, lender);
+        balance.checked_sub(borrowed).unwrap_or(0).max(0)
+    }
+
+    /// Return the sum of every lender's gross pool balance (AC-041).
+    pub fn get_total_lender_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalLenderBalance)
+            .unwrap_or(0)
+    }
+
+    /// Return the total principal currently lent out across all loans.
+    pub fn get_active_loans_liquidity(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActiveLoansLiquidity)
+            .unwrap_or(0)
+    }
+
     /// Returns the current annualized loan interest rate in basis points.
     pub fn get_interest_rate(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0)
@@ -997,6 +1044,21 @@ impl LendingPool {
         if phase == ContractPhase::Paused {
             env.panic_with_error(Error::Paused);
         }
+    }
+
+    /// Apply `delta` to the pool-wide `TotalLenderBalance` aggregate (AC-041).
+    fn adjust_total_lender_balance(env: &Env, delta: i128) {
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalLenderBalance)
+            .unwrap_or(0);
+        let new_total = total
+            .checked_add(delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::InvalidAmount));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLenderBalance, &new_total);
     }
 
     // FIX(#322): Guard against zero total deposits / zero inputs before
