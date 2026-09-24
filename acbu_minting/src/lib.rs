@@ -1754,13 +1754,14 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
     let digest = env.crypto().sha256(&preimage).to_array();
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let prefix_bytes = prefix.as_bytes();
-    let mut buf = [0u8; 80];
+    // prefix + '_' + 64 hex chars; panic early if prefix is unreasonably long
+    assert!(prefix_bytes.len() <= 64, "tx_id prefix too long");
+    let total = prefix_bytes.len() + 1 + 64;
+    let mut buf = [0u8; 129]; // 64 (max prefix) + 1 + 64
     let mut offset = 0usize;
 
-    for &b in prefix_bytes.iter() {
-        buf[offset] = b;
-        offset += 1;
-    }
+    buf[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
+    offset += prefix_bytes.len();
     buf[offset] = b'_';
     offset += 1;
 
@@ -1772,7 +1773,7 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
 
     SorobanString::from_str(
         env,
-        core::str::from_utf8(&buf[..offset]).unwrap_or("mint_invalid_tx_id"),
+        core::str::from_utf8(&buf[..total]).unwrap_or("mint_invalid_tx_id"),
     )
 }
 
