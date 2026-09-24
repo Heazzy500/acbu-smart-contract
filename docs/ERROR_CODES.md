@@ -212,4 +212,5 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 8016 | `DuplicateCurrency` | currency already tracked |
 | 8012 | `NoPendingUpgrade` | no pending upgrade |
 | 8013 | `TimelockNotElapsed` | timelock has not elapsed |
+| 8017 | `OracleStale` | oracle rate is stale |
 | 8999 | `Unknown` | unknown reserve tracker error |

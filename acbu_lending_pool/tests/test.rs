@@ -525,12 +525,9 @@ fn test_loan_lifecycle_emits_events() {
         .iter()
         .rev()
         .find(|e| {
-            e.1.first().map_or(false, |t| {
-                if let Ok(symbol_val) = TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env) {
-                    symbol_val == symbol_short!("borrow")
-                } else {
-                    false
-                }
+            e.1.first().is_some_and(|t| {
+                TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env)
+                    .is_ok_and(|s| s == symbol_short!("borrow"))
             })
         })
         .expect("borrow event not found");
@@ -556,12 +553,9 @@ fn test_loan_lifecycle_emits_events() {
         .iter()
         .rev()
         .find(|e| {
-            e.1.first().map_or(false, |t| {
-                if let Ok(symbol_val) = TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env) {
-                    symbol_val == symbol_short!("repay")
-                } else {
-                    false
-                }
+            e.1.first().is_some_and(|t| {
+                TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env)
+                    .is_ok_and(|s| s == symbol_short!("repay"))
             })
         })
         .expect("repay event not found");
@@ -587,14 +581,9 @@ fn test_loan_lifecycle_emits_events() {
         .iter()
         .rev()
         .find(|e| {
-            e.1.first().map_or(false, |t| {
-                if let Ok(symbol_val) =
-                    TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env)
-                {
-                    symbol_val == symbol_short!("repaymt")
-                } else {
-                    false
-                }
+            e.1.first().is_some_and(|t| {
+                TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(&t, &env)
+                    .is_ok_and(|s| s == symbol_short!("repaymt"))
             })
         })
         .expect("repayment event not found");
@@ -819,8 +808,7 @@ fn test_accounting_invariant_holds_through_interest_lifecycle() {
         assert_eq!(
             tracked,
             token_client.balance(&contract_id),
-            "invariant broken after {}",
-            label
+            "invariant broken after {label}"
         );
     };
 
