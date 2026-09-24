@@ -2,8 +2,12 @@
 set -e
 
 # Configuration
+# ⚠️  AX-002 fix: secret key is no longer hardcoded here.
+# Set STELLAR_SECRET_KEY in your environment before running this script:
+#   export STELLAR_SECRET_KEY="S..."
+# Never commit a real secret key to source control.
 NETWORK="testnet"
-SECRET="SA2P2MWG4L4KMKYXNVSS73NTZWKRYDPJDXLVODDSYCPWQ5LVIZNXIBAR"
+SECRET="${STELLAR_SECRET_KEY:?Error: STELLAR_SECRET_KEY environment variable is not set. Export it before running this script.}"
 ADMIN="GDHO63RZEUNDRVF6WA7HD4D7PLNLUMSK5H74ONW3MEF3VKF4BZJ6GDML"
 
 # Contract IDs

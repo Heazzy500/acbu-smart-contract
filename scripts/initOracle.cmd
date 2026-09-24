@@ -1,6 +1,13 @@
 @echo off
+rem AX-002 fix: secret key is no longer hardcoded here.
+rem Set STELLAR_SECRET_KEY in your environment before running this script:
+rem   set STELLAR_SECRET_KEY=S...
+rem Never commit a real secret key to source control.
+if "%STELLAR_SECRET_KEY%"=="" (
+    echo Error: STELLAR_SECRET_KEY environment variable is not set. Set it before running this script.
+    exit /b 1
+)
 set STELLAR_NETWORK=testnet
-set STELLAR_SECRET_KEY=SA2P2MWG4L4KMKYXNVSS73NTZWKRYDPJDXLVODDSYCPWQ5LVIZNXIBAR
 set ADMIN=GDHO63RZEUNDRVF6WA7HD4D7PLNLUMSK5H74ONW3MEF3VKF4BZJ6GDML
 set ORACLE=CCJ6L5CVLRSLYVYWMEFSC3QZ5OHAB2DEVFV6GUWCAMF4NZIO7CYE66OQ
 

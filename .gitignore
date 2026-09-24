@@ -22,6 +22,11 @@
 .env
 .env.*
 
+# Initialization scripts that may contain secrets — keep local only (AX-002)
+# These scripts should not be committed; use environment variables for credentials.
+scripts/init_temp.sh
+scripts/initOracle.cmd
+
 # OS files
 .DS_Store
 Thumbs.db
