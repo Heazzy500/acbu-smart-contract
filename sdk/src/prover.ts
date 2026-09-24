@@ -10,7 +10,11 @@ import { Noir } from "@noir-lang/noir_js";
 import { BarretenbergBackend } from "@noir-lang/backend_barretenberg";
 import { compile } from "@noir-lang/noir_wasm";
 import type { ProofArtifacts, ComplianceInput } from "./types.js";
-import { computeCommitment, computeNullifier } from "./poseidon.js";
+import {
+  computeCommitment,
+  computeNullifier,
+  fieldToBytes32,
+} from "./poseidon.js";
 
 let noirInstance: Noir | null = null;
 
@@ -57,6 +61,8 @@ export async function generateProof(
     proof: proofData.proof,
     publicInputs: proofData.publicInputs,
     vk: proofData.vk,
-    nullifier: proofData.publicInputs.slice(-32), // last 32 bytes
+    // Use the named value supplied to the circuit. Parsing the final 32 bytes
+    // of serialized public inputs coupled replay protection to field ordering.
+    nullifier: fieldToBytes32(nullifier),
   };
 }

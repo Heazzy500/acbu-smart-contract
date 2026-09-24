@@ -318,6 +318,9 @@ pub enum ContractError {
     /// the trusted KYC authority (zk_verifier trusted commitment registry,
     /// AZ-002).
     CommitmentNotAttested = 17,
+    /// The submitted nullifier was already consumed for this credential
+    /// commitment and cannot be replayed (zk_verifier, AZ-025).
+    NullifierAlreadySpent = 18,
 
     Unknown = 9999,
 }
@@ -342,6 +345,7 @@ impl core::fmt::Display for ContractError {
             ContractError::InvalidCircuitPeer => write!(f, "invalid circuit-breaker peer"),
             ContractError::CommitmentAlreadyAttested => write!(f, "commitment already attested"),
             ContractError::CommitmentNotAttested => write!(f, "commitment not attested"),
+            ContractError::NullifierAlreadySpent => write!(f, "nullifier already spent"),
             ContractError::Unknown => write!(f, "unknown error"),
         }
     }

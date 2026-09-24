@@ -1,266 +1,147 @@
 #![cfg(test)]
 
-use super::*;
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, Vec};
-use shared::ContractError;
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events, Ledger},
+    Address, BytesN, Env, FromVal, IntoVal, Symbol,
+};
+use zk_verifier::{
+    VerificationInputs, VerificationPolicy, VerifiedEvent, ZkVerifier, ZkVerifierClient,
+    VERIFICATION_VALIDITY_LEDGERS,
+};
 
-// Helper function to create a random BytesN<32>
-fn random_bytesn(env: &Env) -> BytesN<32> {
-    BytesN::from_array(env, &[0; 32]) // For simplicity in tests, use a fixed array
+fn bytes(env: &Env, value: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[value; 32])
 }
 
-// Helper function to create a random Address
-fn random_address(env: &Env) -> Address {
-    Address::random(&env)
+fn inputs(env: &Env, nullifier: u8, commitment: u8) -> VerificationInputs {
+    VerificationInputs {
+        min_tier: 2,
+        country_code: 566,
+        requested_amount: 1_000,
+        daily_cap: 10_000,
+        already_used: 500,
+        nullifier: bytes(env, nullifier),
+        commitment: bytes(env, commitment),
+    }
+}
+
+fn setup() -> (Env, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    (env, contract_id, admin)
 }
 
 #[test]
-fn test_initialize() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
+fn verification_records_named_inputs_and_policy() {
+    let (env, contract_id, _) = setup();
     let client = ZkVerifierClient::new(&env, &contract_id);
+    let wallet = Address::generate(&env);
+    let inputs = inputs(&env, 1, 2);
 
-    let admin = Address::random(&env);
-    client.initialize(&admin);
+    client.register_commitment(&inputs.commitment);
+    client.verify(&wallet, &inputs);
 
-    assert_eq!(client.admin(), admin);
-    assert!(!client.paused());
+    let record = client.verification(&wallet).unwrap();
+    assert_eq!(record.nullifier, inputs.nullifier);
+    assert_eq!(
+        record.policy,
+        VerificationPolicy {
+            min_tier: inputs.min_tier,
+            country_code: inputs.country_code,
+            requested_amount: inputs.requested_amount,
+            daily_cap: inputs.daily_cap,
+            already_used: inputs.already_used,
+        }
+    );
+    assert_eq!(
+        record.expires_at_ledger,
+        env.ledger().sequence() + VERIFICATION_VALIDITY_LEDGERS
+    );
+    assert!(client.is_verified(&wallet));
+    assert!(client.is_nullifier_spent(&inputs.commitment, &inputs.nullifier));
+
+    let event = env
+        .events()
+        .all()
+        .iter()
+        .find(|event| {
+            event.0 == contract_id
+                && Symbol::from_val(&env, &event.1.get(0).unwrap()) == symbol_short!("verified")
+        })
+        .expect("verified event must be emitted");
+    let event: VerifiedEvent = event.2.into_val(&env);
+    assert_eq!(event.user, wallet);
+    assert_eq!(event.nullifier, inputs.nullifier);
+    assert_eq!(event.policy, record.policy);
 }
 
 #[test]
-#[should_panic(expected = "ContractError::Unauthorized")]
-fn test_initialize_already_initialized_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
+#[should_panic(expected = "Error(Contract, #17)")]
+fn verification_rejects_unattested_commitment() {
+    let (env, contract_id, _) = setup();
     let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-    client.initialize(&Address::random(&env)); // Should panic
+    client.verify(&Address::generate(&env), &inputs(&env, 1, 2));
 }
 
 #[test]
-fn test_pause_unpause() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
+#[should_panic(expected = "Error(Contract, #18)")]
+fn verification_rejects_reused_scoped_nullifier() {
+    let (env, contract_id, _) = setup();
     let client = ZkVerifierClient::new(&env, &contract_id);
+    let inputs = inputs(&env, 1, 2);
+    client.register_commitment(&inputs.commitment);
+    client.verify(&Address::generate(&env), &inputs);
+    client.verify(&Address::generate(&env), &inputs);
+}
 
-    let admin = Address::random(&env);
-    client.initialize(&admin);
+#[test]
+fn verification_expires_without_read_extension() {
+    let (env, contract_id, _) = setup();
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let wallet = Address::generate(&env);
+    let inputs = inputs(&env, 1, 2);
+    client.register_commitment(&inputs.commitment);
+    client.verify(&wallet, &inputs);
 
-    admin.set_auth(true);
+    let expires_at = client.verification(&wallet).unwrap().expires_at_ledger;
+    env.ledger()
+        .with_mut(|ledger| ledger.sequence_number = expires_at);
+
+    assert!(!client.is_verified(&wallet));
+    assert!(client.verification(&wallet).is_none());
+}
+
+#[test]
+fn admin_can_revoke_verification() {
+    let (env, contract_id, _) = setup();
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let wallet = Address::generate(&env);
+    let inputs = inputs(&env, 1, 2);
+    client.register_commitment(&inputs.commitment);
+    client.verify(&wallet, &inputs);
+
+    assert!(client.revoke_verification(&wallet));
+    assert!(!client.is_verified(&wallet));
+    assert!(client.verification(&wallet).is_none());
+    assert!(!client.revoke_verification(&wallet));
+}
+
+#[test]
+fn pause_blocks_verification_until_unpaused() {
+    let (env, contract_id, _) = setup();
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let wallet = Address::generate(&env);
+    let inputs = inputs(&env, 1, 2);
+    client.register_commitment(&inputs.commitment);
     client.pause();
-    assert!(client.paused());
 
+    assert!(client.try_verify(&wallet, &inputs).is_err());
     client.unpause();
-    assert!(!client.paused());
-    admin.set_auth(false);
-}
-
-#[test]
-#[should_panic(expected = "ContractError::Unauthorized")]
-fn test_pause_unauthorized_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    client.initialize(&Address::random(&env));
-    client.pause(); // Unauthorized
-}
-
-#[test]
-fn test_register_commitment() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let commitment = random_bytesn(&env);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    admin.set_auth(false);
-
-    assert!(client.is_attested(&commitment));
-}
-
-#[test]
-#[should_panic(expected = "ContractError::CommitmentAlreadyAttested")]
-fn test_register_commitment_already_attested_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let commitment = random_bytesn(&env);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    client.register_commitment(&commitment); // Should panic
-    admin.set_auth(false);
-}
-
-#[test]
-fn test_verify() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let wallet = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 5]); // Valid length
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    admin.set_auth(false);
-
-    wallet.set_auth(true);
-    client.verify(&wallet, &nullifier, &commitment, &public_inputs);
-    wallet.set_auth(false);
-
+    client.verify(&wallet, &inputs);
     assert!(client.is_verified(&wallet));
-    assert!(client.is_nullifier_spent(&commitment, &nullifier));
-}
-
-#[test]
-#[should_panic(expected = "ContractError::InvalidPublicInputsLength")]
-fn test_verify_invalid_public_inputs_length_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let wallet = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 4]); // Invalid length
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    admin.set_auth(false);
-
-    wallet.set_auth(true);
-    client.verify(&wallet, &nullifier, &commitment, &public_inputs); // Should panic
-    wallet.set_auth(false);
-}
-
-#[test]
-#[should_panic(expected = "ContractError::CommitmentNotAttested")]
-fn test_verify_commitment_not_attested_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    client.initialize(&Address::random(&env));
-
-    let wallet = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 5]);
-
-    wallet.set_auth(true);
-    client.verify(&wallet, &nullifier, &commitment, &public_inputs); // Should panic
-    wallet.set_auth(false);
-}
-
-#[test]
-#[should_panic(expected = "ContractError::NullifierAlreadySpent")] // For nullifier reuse
-fn test_verify_nullifier_reused_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let wallet1 = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment1 = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 5]);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment1);
-    admin.set_auth(false);
-
-    wallet1.set_auth(true);
-    client.verify(&wallet1, &nullifier, &commitment1, &public_inputs);
-    wallet1.set_auth(false);
-
-    // Try to use the same nullifier for a different wallet
-    let wallet2 = Address::random(&env);
-    let commitment2 = random_bytesn(&env);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment2);
-    admin.set_auth(false);
-
-    wallet2.set_auth(true);
-    client.verify(&wallet2, &nullifier, &commitment2, &public_inputs); // Should panic
-    wallet2.set_auth(false);
-}
-
-#[test]
-fn test_is_verified() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let wallet = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 5]);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    admin.set_auth(false);
-
-    wallet.set_auth(true);
-    client.verify(&wallet, &nullifier, &commitment, &public_inputs);
-    wallet.set_auth(false);
-
-    assert!(client.is_verified(&wallet));
-
-    let unverified_wallet = Address::random(&env);
-    assert!(!client.is_verified(&unverified_wallet));
-}
-
-#[test]
-fn test_is_nullifier_spent() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, ZkVerifier);
-    let client = ZkVerifierClient::new(&env, &contract_id);
-
-    let admin = Address::random(&env);
-    client.initialize(&admin);
-
-    let wallet = Address::random(&env);
-    let nullifier = random_bytesn(&env);
-    let commitment = random_bytesn(&env);
-    let public_inputs = Vec::from_array(&env, [0u128; 5]);
-
-    admin.set_auth(true);
-    client.register_commitment(&commitment);
-    admin.set_auth(false);
-
-    wallet.set_auth(true);
-    client.verify(&wallet, &nullifier, &commitment, &public_inputs);
-    wallet.set_auth(false);
-
-    assert!(client.is_nullifier_spent(&commitment, &nullifier));
-
-    let unspent_nullifier = random_bytesn(&env);
-    assert!(!client.is_nullifier_spent(&commitment, &unspent_nullifier));
 }

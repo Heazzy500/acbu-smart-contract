@@ -17,25 +17,24 @@
 //!
 //! ```text
 //! DataKey::Nullifier(BytesN<32>)  →  bool      (ledger-TTL-bumped on each verify)
-//! DataKey::Verified(Address)      →  bool      (ledger-TTL-bumped on each verify)
+//! DataKey::Verified(Address)      →  VerificationRecord (fixed validity deadline)
 //! DataKey::AttestedCommitment(BytesN<32>) → bool (ledger-TTL-bumped on register)
 //! DataKey::Admin                  →  Address   (instance — single scalar, bounded)
 //! DataKey::Paused                 →  bool      (instance — single scalar, bounded)
 //! ```
 //!
-//! Each entry lives in `persistent` storage and receives a TTL bump on every
-//! successful verification.  Entries that are never re-verified expire
-//! automatically after `NULLIFIER_TTL_LEDGERS`, keeping storage bounded.
+//! Each entry lives in `persistent` storage. Nullifiers and attestations use a
+//! bounded storage TTL, while verification records carry an immutable validity
+//! deadline and can also be revoked by the administrator.
 //!
 //! Instance storage is used **only** for the small, fixed set of contract
 //! configuration fields (admin, paused flag) whose combined size is a known
 //! constant that cannot grow at runtime.
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env, Vec,
-};
 use shared::ContractError;
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, BytesN, Env,
+};
 
 // ---------------------------------------------------------------------------
 // Storage TTL constants
@@ -55,8 +54,57 @@ const NULLIFIER_TTL_THRESHOLD: u32 = NULLIFIER_TTL_LEDGERS / 2;
 /// TTL for the instance storage (admin + paused flag).
 const INSTANCE_TTL_LEDGERS: u32 = 5_256_000; // ~1 year
 
-/// Maximum expected length for public inputs slice.
-const MAX_PUBLIC_INPUTS_LEN: u32 = 5;
+/// A verification remains valid for about 30 days at one ledger per 5 seconds.
+pub const VERIFICATION_VALIDITY_LEDGERS: u32 = 525_600;
+
+/// The policy proved by the caller and recorded for downstream audit/indexing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationPolicy {
+    pub min_tier: u32,
+    pub country_code: u32,
+    pub requested_amount: u128,
+    pub daily_cap: u128,
+    pub already_used: u128,
+}
+
+/// Named circuit inputs. Keeping these fields structured prevents callers from
+/// silently changing their meaning by reordering or re-padding a byte vector.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationInputs {
+    pub min_tier: u32,
+    pub country_code: u32,
+    pub requested_amount: u128,
+    pub daily_cap: u128,
+    pub already_used: u128,
+    pub nullifier: BytesN<32>,
+    pub commitment: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationRecord {
+    pub expires_at_ledger: u32,
+    pub nullifier: BytesN<32>,
+    pub policy: VerificationPolicy,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedEvent {
+    pub user: Address,
+    pub nullifier: BytesN<32>,
+    pub policy: VerificationPolicy,
+    pub expires_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationRevokedEvent {
+    pub user: Address,
+    pub revoked_at_ledger: u32,
+}
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -74,7 +122,7 @@ pub enum DataKey {
     /// Stored in *persistent* storage so entries expire individually via TTL
     /// rather than accumulating in a single unbounded instance `Map`.
     ScopedNullifier(BytesN<32>, BytesN<32>),
-    /// Verified wallet — keyed per address.
+    /// Verified wallet record — keyed per address and bounded by its deadline.
     ///
     /// Stored in *persistent* storage for the same reason as `Nullifier`.
     Verified(Address),
@@ -142,10 +190,8 @@ impl ZkVerifier {
             NULLIFIER_TTL_LEDGERS,
         );
 
-        env.events().publish(
-            (symbol_short!("attested"), commitment.clone()),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("attested"), commitment.clone()), ());
 
         Self::extend_instance_ttl(&env);
     }
@@ -167,7 +213,7 @@ impl ZkVerifier {
     }
 
     /// Record a successful proof verification for `wallet` with the given
-    /// `nullifier` and credential `commitment`.
+    /// named public inputs, including the nullifier and credential commitment.
     ///
     /// # AZ-014
     ///
@@ -190,23 +236,19 @@ impl ZkVerifier {
     /// attested by the trusted KYC authority first. Proofs about commitments
     /// that were never attested are rejected — the proof would otherwise be
     /// vacuous (knowledge of *some* preimage for a self-chosen commitment).
-    pub fn verify(
-        env: Env,
-        wallet: Address,
-        nullifier: BytesN<32>,
-        commitment: BytesN<32>,
-        public_inputs: Vec<u128>,
-    ) {
+    pub fn verify(env: Env, wallet: Address, inputs: VerificationInputs) {
         wallet.require_auth();
         Self::assert_not_paused(&env);
 
-        // AZ-007: Enforce bound on public_inputs length to prevent resource abuse.
-        // This check assumes `public_inputs` are passed directly to the contract.
-        // If they are part of a larger proof structure, this check would need to be
-        // integrated at the point where they are deserialized or used.
-        if public_inputs.len() != MAX_PUBLIC_INPUTS_LEN {
-            panic_with_error!(&env, ContractError::InvalidPublicInputsLength);
-        }
+        let nullifier = inputs.nullifier.clone();
+        let commitment = inputs.commitment.clone();
+        let policy = VerificationPolicy {
+            min_tier: inputs.min_tier,
+            country_code: inputs.country_code,
+            requested_amount: inputs.requested_amount,
+            daily_cap: inputs.daily_cap,
+            already_used: inputs.already_used,
+        };
 
         // AZ-002 — reject proofs whose commitment was never attested by the
         // trusted KYC authority.
@@ -238,19 +280,34 @@ impl ZkVerifier {
             NULLIFIER_TTL_LEDGERS,
         );
 
-        // Mark the wallet as verified.
+        // Store an immutable validity deadline. Reads never extend this deadline,
+        // so a stale credential cannot remain valid merely because it is queried.
+        let expires_at_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(VERIFICATION_VALIDITY_LEDGERS);
+        let record = VerificationRecord {
+            expires_at_ledger,
+            nullifier: nullifier.clone(),
+            policy: policy.clone(),
+        };
         env.storage()
             .persistent()
-            .set(&DataKey::Verified(wallet.clone()), &true);
+            .set(&DataKey::Verified(wallet.clone()), &record);
         env.storage().persistent().extend_ttl(
             &DataKey::Verified(wallet.clone()),
-            NULLIFIER_TTL_THRESHOLD,
-            NULLIFIER_TTL_LEDGERS,
+            VERIFICATION_VALIDITY_LEDGERS / 2,
+            VERIFICATION_VALIDITY_LEDGERS,
         );
 
         env.events().publish(
-            (symbol_short!("verified"), wallet.clone()),
-            (nullifier,),
+            (symbol_short!("verified"),),
+            VerifiedEvent {
+                user: wallet,
+                nullifier,
+                policy,
+                expires_at_ledger,
+            },
         );
 
         Self::extend_instance_ttl(&env);
@@ -258,20 +315,22 @@ impl ZkVerifier {
 
     // ── Read helpers ────────────────────────────────────────────────────────
 
-    /// Returns `true` if `wallet` has a live verified entry.
+    /// Returns `true` only while `wallet` has a non-expired verification.
     pub fn is_verified(env: Env, wallet: Address) -> bool {
         let key = DataKey::Verified(wallet);
-        if env.storage().persistent().has(&key) {
-            // Bump TTL on read so actively-queried entries stay alive.
-            env.storage().persistent().extend_ttl(
-                &key,
-                NULLIFIER_TTL_THRESHOLD,
-                NULLIFIER_TTL_LEDGERS,
-            );
-            true
-        } else {
-            false
-        }
+        env.storage()
+            .persistent()
+            .get::<_, VerificationRecord>(&key)
+            .is_some_and(|record| env.ledger().sequence() < record.expires_at_ledger)
+    }
+
+    /// Return the current verification record when it is still valid.
+    pub fn verification(env: Env, wallet: Address) -> Option<VerificationRecord> {
+        let key = DataKey::Verified(wallet);
+        env.storage()
+            .persistent()
+            .get::<_, VerificationRecord>(&key)
+            .filter(|record| env.ledger().sequence() < record.expires_at_ledger)
     }
 
     /// Returns `true` if `nullifier` has already been spent for `commitment`.
@@ -295,6 +354,27 @@ impl ZkVerifier {
         Self::check_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::extend_instance_ttl(&env);
+    }
+
+    /// Revoke a wallet's verification immediately. Only the administrator may
+    /// revoke, and successful revocations are emitted for off-chain indexers.
+    pub fn revoke_verification(env: Env, wallet: Address) -> bool {
+        Self::check_admin(&env);
+        let key = DataKey::Verified(wallet.clone());
+        if !env.storage().persistent().has(&key) {
+            return false;
+        }
+
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("revoked"),),
+            VerificationRevokedEvent {
+                user: wallet,
+                revoked_at_ledger: env.ledger().sequence(),
+            },
+        );
+        Self::extend_instance_ttl(&env);
+        true
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────

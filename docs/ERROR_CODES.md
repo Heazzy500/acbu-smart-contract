@@ -25,6 +25,7 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 15 | `InvalidCircuitPeer` | A circuit-breaker peer list is invalid: too many entries, a duplicate, or the contract itself. |
 | 16 | `CommitmentAlreadyAttested` | The credential commitment was already attested by the KYC authority (zk_verifier trusted commitment registry, AZ-002). |
 | 17 | `CommitmentNotAttested` | The credential commitment submitted with a proof was never attested by the trusted KYC authority (zk_verifier trusted commitment registry, AZ-002). |
+| 18 | `NullifierAlreadySpent` | The submitted nullifier was already consumed for this credential commitment and cannot be replayed (zk_verifier, AZ-025). |
 | 9999 | `Unknown` | unknown error |
 
 ## `shared / reentrancy guard` - `ReentrancyError`
@@ -76,7 +77,8 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 1019 | `NoPendingAdmin` | no pending admin |
 | 1020 | `AdminTimelockNotElapsed` | admin timelock has not elapsed |
 | 1021 | `NoPendingAdminToCancel` | no pending admin to cancel |
-| 1022 | `InsufficientYieldReserve` | vault balance cannot cover principal + yield owed |
+| 1022 | `InsufficientYieldReserve` | yield reserve cannot cover this amount |
+| 1023 | `NothingToClaim` | `claim_yield` called with no owed yield (AC-007). |
 | 1999 | `Unknown` | unknown savings vault error |
 
 ## `acbu_lending_pool` - `Error`
@@ -157,6 +159,8 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 5026 | `SlippageExceeded` | The computed ACBU output is below the caller-supplied `min_acbu_out` floor, indicating that same-block oracle movement would cause unacceptable slippage. The transaction should be retried with updated parameters. |
 | 5028 | `ArithmeticOverflow` | A fee computation overflowed `i128` (AC-028). |
 | 5029 | `InvalidCircuitPeer` | The circuit-breaker peer list is invalid (too long, duplicate, or self). |
+| 5030 | `BurningContractNotSet` | `record_burn` called while no burning contract is linked (AC-005). |
+| 5031 | `InvalidBurnAmount` | `record_burn` called with a non-positive amount (AC-005). |
 | 5999 | `Unknown` | unknown minting error |
 
 ## `acbu_oracle` - `OracleError`
