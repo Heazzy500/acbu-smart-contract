@@ -388,6 +388,50 @@ pub fn check_rate_gate(
 }
 
 // ---------------------------------------------------------------------------
+// Per-pool / per-policy access checks (AZ-010)
+// ---------------------------------------------------------------------------
+
+/// Pool-local access policy. Unlike a global "wallet was ever verified" flag,
+/// this captures the thresholds a *specific* pool (or product) requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolAccessPolicy {
+    /// Minimum KYC tier the pool accepts.
+    pub required_tier: KycTier,
+    /// When `Some`, the user's country must equal this code. When `None`, the
+    /// pool does not impose an extra country restriction beyond the tier rules
+    /// already enforced by [`check_rate_gate`].
+    pub allowed_country: Option<CountryCode>,
+}
+
+/// Evaluate whether a wallet may enter a pool under that pool's policy.
+///
+/// Global verification alone is **not** sufficient: a user who cleared a
+/// low-tier / permissive pool must still be rejected by a stricter pool that
+/// demands a higher KYC tier or a specific country allow-list.
+///
+/// # Errors
+///
+/// | Condition                                         | Error                |
+/// |---------------------------------------------------|----------------------|
+/// | `user_tier < policy.required_tier`                | `KycBlocked`         |
+/// | `policy.allowed_country` set and country mismatch | `CountryNotAllowed`  |
+pub fn check_pool_access(
+    user_tier: KycTier,
+    user_country: CountryCode,
+    policy: PoolAccessPolicy,
+) -> Result<(), VerifierError> {
+    if user_tier < policy.required_tier {
+        return Err(VerifierError::KycBlocked);
+    }
+    if let Some(required) = policy.allowed_country {
+        if user_country != required {
+            return Err(VerifierError::CountryNotAllowed);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Fee calculation helpers (pure arithmetic, no Soroban dependency)
 // ---------------------------------------------------------------------------
 
@@ -1006,4 +1050,47 @@ mod tests {
         // requested_amount, daily_cap, already_used.
         assert_eq!(PUBLIC_INPUTS_LEN, 5);
     }
+
+    // ── check_pool_access (AZ-010) ───────────────────────────────────────────
+
+    #[test]
+    fn pool_policy_rejects_globally_verified_user_below_required_tier() {
+        // User cleared a Tier-1 pool earlier (globally "verified") but this pool
+        // requires Tier 2 — must still fail.
+        let us = CountryCode::from_bytes(*b"US");
+        let policy = PoolAccessPolicy {
+            required_tier: KycTier::Two,
+            allowed_country: None,
+        };
+        assert_eq!(
+            check_pool_access(KycTier::One, us, policy).unwrap_err(),
+            VerifierError::KycBlocked
+        );
+    }
+
+    #[test]
+    fn pool_policy_rejects_wrong_country_even_when_tier_ok() {
+        let us = CountryCode::from_bytes(*b"US");
+        let ng = CountryCode::from_bytes(*b"NG");
+        let policy = PoolAccessPolicy {
+            required_tier: KycTier::One,
+            allowed_country: Some(us),
+        };
+        assert_eq!(
+            check_pool_access(KycTier::Two, ng, policy).unwrap_err(),
+            VerifierError::CountryNotAllowed
+        );
+    }
+
+    #[test]
+    fn pool_policy_allows_matching_tier_and_country() {
+        let us = CountryCode::from_bytes(*b"US");
+        let policy = PoolAccessPolicy {
+            required_tier: KycTier::Two,
+            allowed_country: Some(us),
+        };
+        assert!(check_pool_access(KycTier::Three, us, policy).is_ok());
+        assert!(check_pool_access(KycTier::Two, us, policy).is_ok());
+    }
+
 }
