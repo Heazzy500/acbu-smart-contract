@@ -695,3 +695,52 @@ fn test_mint_from_usdc_routes_fee_to_treasury() {
     // Verify contract retains total deposited USDC as reserve backing
     assert_eq!(usdc_client.balance(&client.address), mint_amount, "contract should hold total USDC as reserve backing");
 }
+
+#[test]
+fn test_mint_from_basket_returns_net_mint() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, oracle, reserve_tracker, acbu_token_id, usdc_token_id, client) = setup_test(&env);
+    let user = account(&env);
+    let vault = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let stoken_sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let stoken_id = stoken_sac.address();
+    establish_trustline(&env, &user, &stoken_sac);
+    soroban_sdk::token::StellarAssetClient::new(&env, &stoken_id).mint(&user, &(1_000 * DECIMALS));
+
+    oracle_mock_client(&env, &oracle).seed_stoken(&stoken_id);
+
+    let fee_rate = 300i128; // 3%
+    let fee_single = 100i128;
+
+    init_mint_client(
+        &env,
+        &client,
+        &admin,
+        &oracle,
+        &reserve_tracker,
+        &acbu_token_id,
+        &usdc_token_id,
+        &vault,
+        &treasury,
+        fee_rate,
+        fee_single,
+    );
+
+    let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token_id);
+
+    let acbu_amt = 100 * DECIMALS;
+    let expected_fee = shared::calculate_fee(acbu_amt, fee_rate).unwrap(); // 3 * DECIMALS
+    let expected_net = acbu_amt - expected_fee; // 97 * DECIMALS
+
+    let proof_id = soroban_sdk::String::from_str(&env, "proof_basket_test");
+    let returned_amount = client.mint_from_basket(&user, &user, &acbu_amt, &proof_id);
+
+    // AC-018: mint_from_basket must return net_mint, NOT gross acbu_amt
+    assert_eq!(returned_amount, expected_net, "mint_from_basket must return net_mint");
+    assert_eq!(acbu_client.balance(&user), expected_net, "user must receive net_mint");
+    assert_eq!(acbu_client.balance(&treasury), expected_fee, "treasury must receive fee");
+}

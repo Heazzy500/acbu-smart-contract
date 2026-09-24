@@ -636,7 +636,7 @@ impl MintingContract {
 
         // Release re-entrancy guard
 
-        acbu_amount
+        net_mint
     }
 
     /// Single S-token deposit: Afreum ramp delivers one S-token; fee tier is `fee_single_bps`.
