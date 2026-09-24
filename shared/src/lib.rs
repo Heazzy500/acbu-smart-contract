@@ -311,6 +311,14 @@ pub enum ContractError {
     /// or the contract itself.
     InvalidCircuitPeer = 15,
 
+    /// The credential commitment was already attested by the KYC authority
+    /// (zk_verifier trusted commitment registry, AZ-002).
+    CommitmentAlreadyAttested = 14,
+    /// The credential commitment submitted with a proof was never attested by
+    /// the trusted KYC authority (zk_verifier trusted commitment registry,
+    /// AZ-002).
+    CommitmentNotAttested = 15,
+
     Unknown = 9999,
 }
 
