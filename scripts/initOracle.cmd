@@ -1,10 +1,12 @@
 @echo off
-rem AX-002 fix: secret key is no longer hardcoded here.
-rem Set STELLAR_SECRET_KEY in your environment before running this script:
-rem   set STELLAR_SECRET_KEY=S...
-rem Never commit a real secret key to source control.
-if "%STELLAR_SECRET_KEY%"=="" (
-    echo Error: STELLAR_SECRET_KEY environment variable is not set. Set it before running this script.
+rem AX-002: Never hardcode signing keys. Set STELLAR_SECRET_KEY in your
+rem environment (or CI secrets) before running this script:
+rem
+rem   set STELLAR_SECRET_KEY=S…your-testnet-key…
+rem
+rem Rotate any key that was previously committed to git history (git filter-repo).
+if not defined STELLAR_SECRET_KEY (
+    echo ERROR: STELLAR_SECRET_KEY is not set. AX-002: do not hardcode keys in scripts.
     exit /b 1
 )
 set STELLAR_NETWORK=testnet

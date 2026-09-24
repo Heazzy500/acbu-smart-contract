@@ -33,7 +33,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env, Vec,
+    Bytes, BytesN, Env, Vec,
 };
 use shared::ContractError;
 
@@ -56,7 +56,16 @@ const NULLIFIER_TTL_THRESHOLD: u32 = NULLIFIER_TTL_LEDGERS / 2;
 const INSTANCE_TTL_LEDGERS: u32 = 5_256_000; // ~1 year
 
 /// Maximum expected length for public inputs slice.
-const MAX_PUBLIC_INPUTS_LEN: u32 = 5;
+///
+/// | Index | Field                 | Description                              |
+/// |-------|-----------------------|------------------------------------------|
+/// |   0   | `min_tier`            | Minimum KYC tier (0–3)                   |
+/// |   1   | `country_code`        | ISO-3166-1 numeric country code          |
+/// |   2   | `requested_amount`    | Transaction amount (7 dec)               |
+/// |   3   | `daily_cap`           | Per-tier daily cap                       |
+/// |   4   | `already_used`        | Already consumed in current daily window |
+/// |   5   | `wallet_address_hash` | sha256(wallet_xdr)[0..16] as u128 (AZ-032) |
+const MAX_PUBLIC_INPUTS_LEN: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -190,6 +199,21 @@ impl ZkVerifier {
     /// attested by the trusted KYC authority first. Proofs about commitments
     /// that were never attested are rejected — the proof would otherwise be
     /// vacuous (knowledge of *some* preimage for a self-chosen commitment).
+    ///
+    /// # AZ-032 — Caller binding
+    ///
+    /// `public_inputs[5]` must equal the first 16 bytes of `sha256(wallet_xdr)`
+    /// interpreted as a little-endian `u128`.  This value is also committed
+    /// inside the ZK circuit (see `zk/circuits/kyc_verifier/src/main.nr`,
+    /// parameter `wallet_address_hash`), so the proof is cryptographically
+    /// bound to exactly one wallet address.
+    ///
+    /// Without this binding an attacker who obtains *any* valid proof
+    /// (e.g. from another user) could re-submit it to mark their own address
+    /// as verified, as long as they also hold an unspent nullifier.  The
+    /// binding makes such an attack impossible: the proof can only be
+    /// accepted when `wallet` matches the address that was encoded at proving
+    /// time.
     pub fn verify(
         env: Env,
         wallet: Address,
@@ -201,11 +225,27 @@ impl ZkVerifier {
         Self::assert_not_paused(&env);
 
         // AZ-007: Enforce bound on public_inputs length to prevent resource abuse.
-        // This check assumes `public_inputs` are passed directly to the contract.
-        // If they are part of a larger proof structure, this check would need to be
-        // integrated at the point where they are deserialized or used.
         if public_inputs.len() != MAX_PUBLIC_INPUTS_LEN {
             panic_with_error!(&env, ContractError::InvalidPublicInputsLength);
+        }
+
+        // AZ-032: Verify that public_inputs[5] (wallet_address_hash) matches
+        // the caller.  We compute sha256(wallet.to_xdr()) and take the first
+        // 16 bytes as a little-endian u128.  This must equal what the prover
+        // committed to in the ZK circuit.
+        let wallet_xdr: Bytes = wallet.clone().to_xdr(&env);
+        let digest: BytesN<32> = env.crypto().sha256(&wallet_xdr);
+        let digest_bytes = digest.to_array();
+        // Take bytes [0..16] and pack as little-endian u128.
+        let mut hash_u128: u128 = 0u128;
+        let mut i: u32 = 0;
+        while i < 16 {
+            hash_u128 |= (digest_bytes[i as usize] as u128) << (i * 8);
+            i += 1;
+        }
+        let claimed: u128 = public_inputs.get_unchecked(5);
+        if hash_u128 != claimed {
+            panic_with_error!(&env, ContractError::ProofCallerMismatch);
         }
 
         // AZ-002 — reject proofs whose commitment was never attested by the
