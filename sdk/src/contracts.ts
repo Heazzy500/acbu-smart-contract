@@ -149,7 +149,7 @@ export async function registerCommitment(
   attesterSecretKey: string,
   verifierContractId: string,
   commitment: Uint8Array,
-  attestedCredential: Uint8Array
+  _attestedCredential?: Uint8Array
 ): Promise<VerificationResult> {
   try {
     const rpc = new SorobanRpc.Server(TESTNET_RPC);
@@ -164,8 +164,7 @@ export async function registerCommitment(
       .addOperation(
         contract.call(
           "register_commitment",
-          nativeToScVal(commitment, { type: "bytes" }),
-          nativeToScVal(attestedCredential, { type: "bytes" })
+          nativeToScVal(Buffer.from(commitment), { type: "bytesN", length: 32 })
         )
       )
       .setTimeout(30)
@@ -186,8 +185,13 @@ export async function registerCommitment(
 }
 
 /**
- * Submit a compliance proof to the verifier contract and mark
+ * Submit a compliance proof result to the verifier contract and mark
  * the calling wallet as verified.
+ *
+ * On-chain `verify(wallet, nullifier, commitment)` records the spent
+ * nullifier after the caller has produced a valid ZK proof off-chain
+ * (see `generateProof`). Proof bytes themselves are not posted — the
+ * contract enforces attestation + nullifier uniqueness + wallet auth.
  */
 export async function submitProof(
   secretKey: string,
@@ -195,6 +199,13 @@ export async function submitProof(
   artifacts: ProofArtifacts
 ): Promise<VerificationResult> {
   try {
+    if (!artifacts.nullifier || artifacts.nullifier.length !== 32) {
+      return { success: false, error: "artifacts.nullifier must be 32 bytes" };
+    }
+    if (!artifacts.commitment || artifacts.commitment.length !== 32) {
+      return { success: false, error: "artifacts.commitment must be 32 bytes" };
+    }
+
     const rpc = new SorobanRpc.Server(TESTNET_RPC);
     const keypair = Keypair.fromSecret(secretKey);
     const source = await rpc.getAccount(keypair.publicKey());
@@ -205,13 +216,18 @@ export async function submitProof(
       networkPassphrase: TESTNET_PASSPHRASE,
     })
       .addOperation(
-        contract.call("verify", {
-          user: Address.fromString(keypair.publicKey()).toScVal(),
-          proof_bytes: nativeToScVal(artifacts.proof, { type: "bytes" }),
-          public_inputs: nativeToScVal(artifacts.publicInputs, {
-            type: "bytes",
+        contract.call(
+          "verify",
+          Address.fromString(keypair.publicKey()).toScVal(),
+          nativeToScVal(Buffer.from(artifacts.nullifier), {
+            type: "bytesN",
+            length: 32,
           }),
-        })
+          nativeToScVal(Buffer.from(artifacts.commitment), {
+            type: "bytesN",
+            length: 32,
+          })
+        )
       )
       .setTimeout(30)
       .build();
@@ -220,11 +236,17 @@ export async function submitProof(
     prepared.sign(keypair);
     const result = await rpc.sendTransaction(prepared);
 
-    if (result.status === "SUCCESS") {
-      return { success: true, txHash: result.hash };
+    // Soroban returns PENDING initially; SUCCESS means accepted into mempool
+    // as of stellar-sdk sendTransaction. Treat ERROR as failure.
+    if (result.status === "ERROR") {
+      return {
+        success: false,
+        error: `Status: ${result.status}`,
+        txHash: result.hash,
+      };
     }
 
-    return { success: false, error: `Status: ${result.status}` };
+    return { success: true, txHash: result.hash };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
@@ -250,9 +272,10 @@ export async function isVerified(
         }
       )
         .addOperation(
-          contract.call("is_v", {
-            user: Address.fromString(walletAddress).toScVal(),
-          })
+          contract.call(
+            "is_verified",
+            Address.fromString(walletAddress).toScVal()
+          )
         )
         .setTimeout(30)
         .build()
