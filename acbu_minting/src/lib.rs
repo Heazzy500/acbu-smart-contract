@@ -1718,17 +1718,32 @@ fn next_tx_nonce(env: &Env) -> u64 {
 
 // ---------------------------------------------------------------------------
 // Proof-replay helpers: used by mint_from_demo_fiat to prevent double-spend.
+// C-070: persistent proof keys must have a bounded lifetime so storage does
+// not grow unboundedly across every processed deposit. Fiat proofs only need
+// replay protection for the off-chain settlement window (a few days at most),
+// so we keep keys alive for 60 days and renew on read — any expired key is
+// treated as unused and can be re-inserted.
 // ---------------------------------------------------------------------------
+const PROOF_TTL: u32 = 5_184_000;
+const PROOF_TTL_THRESHOLD: u32 = 2_592_000;
+
 fn check_proof_unused(env: &Env, proof_id: &SorobanString) -> bool {
-    !env.storage()
-        .persistent()
-        .has(&(DATA_KEY.proof_prefix, proof_id.clone()))
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    let has = env.storage().persistent().has(&key);
+    if has {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
+    }
+    !has
 }
 
 fn mark_proof_used(env: &Env, proof_id: &SorobanString) {
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    env.storage().persistent().set(&key, &true);
     env.storage()
         .persistent()
-        .set(&(DATA_KEY.proof_prefix, proof_id.clone()), &true);
+        .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
 }
 
 // ---------------------------------------------------------------------------
