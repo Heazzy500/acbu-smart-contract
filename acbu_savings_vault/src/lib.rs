@@ -268,7 +268,8 @@ impl SavingsVault {
             .unwrap_or_else(|| env.panic_with_error(Error::InvalidTerm));
 
         let fee_rate = Self::load_fee_rate(&env).unwrap_or_else(|e| env.panic_with_error(e));
-        let fee_amount = calculate_fee(amount, fee_rate);
+        let fee_amount = calculate_fee(amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(Error::Overflow));
         let net_amount = amount
             .checked_sub(fee_amount)
             .unwrap_or_else(|| env.panic_with_error(Error::Overflow));

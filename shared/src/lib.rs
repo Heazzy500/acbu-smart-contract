@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contracterror, contracttype, Address, Env, String as SorobanString, Vec};
+use soroban_sdk::{
+    contracterror, contracttype, Address, Env, String as SorobanString, Symbol, Vec,
+};
 
 pub mod reentrancy_guard;
 
@@ -302,6 +304,12 @@ pub enum ContractError {
     /// output (`min_*_out`), indicating that same-block oracle movement would
     /// cause unacceptable slippage for this transaction.
     SlippageExceeded = 13,
+    /// A fee, deviation or amount computation overflowed `i128`. Returned instead
+    /// of aborting the contract so callers can surface a recoverable error.
+    ArithmeticOverflow = 14,
+    /// A circuit-breaker peer list is invalid: too many entries, a duplicate,
+    /// or the contract itself.
+    InvalidCircuitPeer = 15,
 
     /// The credential commitment was already attested by the KYC authority
     /// (zk_verifier trusted commitment registry, AZ-002).
@@ -330,8 +338,8 @@ impl core::fmt::Display for ContractError {
             ContractError::InvalidRecipient => write!(f, "invalid recipient"),
             ContractError::InvalidVersion => write!(f, "invalid version"),
             ContractError::SlippageExceeded => write!(f, "output below minimum: slippage exceeded"),
-            ContractError::CommitmentAlreadyAttested => write!(f, "commitment already attested"),
-            ContractError::CommitmentNotAttested => write!(f, "commitment not attested by the KYC authority"),
+            ContractError::ArithmeticOverflow => write!(f, "arithmetic overflow"),
+            ContractError::InvalidCircuitPeer => write!(f, "invalid circuit-breaker peer"),
             ContractError::Unknown => write!(f, "unknown error"),
         }
     }
@@ -340,6 +348,10 @@ impl core::fmt::Display for ContractError {
 /// Returns `true` if `oracle_timestamp` is within `max_staleness_seconds` of the
 /// current ledger time. Centralises the `current_time` binding so that no consumer
 /// can omit it — structurally prevents the class of bug reported in SC-001 / #507.
+///
+/// This is a **wall-clock** check only. Close times are proposed by validators and
+/// can drift from the ledger count, so any path that also has the rate's ledger
+/// sequence must pair it with [`check_oracle_ledger_freshness`] (AC-027).
 pub fn check_oracle_freshness(
     env: &Env,
     oracle_timestamp: u64,
@@ -347,6 +359,15 @@ pub fn check_oracle_freshness(
 ) -> bool {
     let current_time = env.ledger().timestamp();
     current_time <= oracle_timestamp.saturating_add(max_staleness_seconds)
+}
+
+/// Returns `true` if a rate written at ledger `rate_ledger` is at most
+/// `max_age_ledgers` ledgers old. Ledger sequence numbers are assigned by the
+/// network and cannot be skewed, so this is the authoritative staleness bound
+/// (see [`STALE_RATE_MAX_LEDGERS`]). A `rate_ledger` ahead of the current ledger
+/// is treated as age 0.
+pub fn check_oracle_ledger_freshness(env: &Env, rate_ledger: u32, max_age_ledgers: u32) -> bool {
+    env.ledger().sequence().saturating_sub(rate_ledger) <= max_age_ledgers
 }
 
 /// Cross-contract method name constants — prevents silent logic splits from typos
@@ -360,6 +381,9 @@ pub const ORACLE_GET_BASKET_WEIGHT: &str = "get_basket_weight";
 pub const ORACLE_GET_S_TOKEN_ADDR: &str = "get_s_token_address";
 pub const ORACLE_GET_RATE_DECIMALS: &str = "get_rate_decimals";
 pub const RESERVE_IS_SUFFICIENT: &str = "is_reserve_sufficient";
+/// Pause query every circuit-breaker peer must expose as `is_paused() -> bool`.
+/// It must only read local state — peers call it on each other.
+pub const CIRCUIT_IS_PAUSED: &str = "is_paused";
 pub const TOKEN_GET_TOTAL_SUPPLY: &str = "get_total_supply";
 
 /// Constants
@@ -378,6 +402,9 @@ pub const MAX_VALIDATORS: u32 = 50; // Maximum number of validators to prevent g
 /// Rates must be refreshed within this window or consumers (minting) will be blocked.
 /// Admin can bypass via `set_rate_admin` for emergency overrides.
 pub const STALE_RATE_MAX_LEDGERS: u32 = 4_320; // ~6 hours at 5 s/ledger
+/// Maximum number of circuit-breaker peers a contract may link to. Each peer
+/// costs one cross-contract call on every guarded operation.
+pub const MAX_CIRCUIT_PEERS: u32 = 5;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -387,18 +414,65 @@ pub enum ContractPhase {
     Paused,
 }
 
-/// Utility functions
-pub fn calculate_fee(amount: i128, fee_rate_bps: i128) -> i128 {
+/// Returns `true` if any circuit-breaker peer reports itself paused (AC-030).
+///
+/// Mint, burn and reserve contracts pause independently; linking them as peers
+/// makes a pause on any one of them halt value movement through all of them.
+/// Fails closed: a peer that cannot be queried, or does not answer with a
+/// `bool`, is treated as paused so a broken link can never silently re-open a
+/// tripped breaker.
+pub fn any_circuit_peer_paused(env: &Env, peers: &Vec<Address>) -> bool {
+    let func = Symbol::new(env, CIRCUIT_IS_PAUSED);
+    for peer in peers.iter() {
+        let res =
+            env.try_invoke_contract::<bool, soroban_sdk::Error>(&peer, &func, Vec::new(env));
+        if !matches!(res, Ok(Ok(false))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validates a circuit-breaker peer list before it is stored: at most
+/// [`MAX_CIRCUIT_PEERS`] entries, no duplicates, and not the calling contract
+/// (a self-call would always fail and so fail closed forever).
+pub fn validate_circuit_peers(env: &Env, peers: &Vec<Address>) -> Result<(), ContractError> {
+    if peers.len() > MAX_CIRCUIT_PEERS {
+        return Err(ContractError::InvalidCircuitPeer);
+    }
+    let this = env.current_contract_address();
+    for (i, peer) in peers.iter().enumerate() {
+        if peer == this {
+            return Err(ContractError::InvalidCircuitPeer);
+        }
+        for other in peers.iter().skip(i + 1) {
+            if other == peer {
+                return Err(ContractError::InvalidCircuitPeer);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fee on `amount` at `fee_rate_bps` basis points, rounded down.
+///
+/// Returns [`ContractError::ArithmeticOverflow`] instead of panicking so a bad
+/// input surfaces as a typed, recoverable contract error (AC-028).
+pub fn calculate_fee(amount: i128, fee_rate_bps: i128) -> Result<i128, ContractError> {
     amount
         .checked_mul(fee_rate_bps)
         .and_then(|v| v.checked_div(BASIS_POINTS))
-        .expect("Overflow in fee calculation")
+        .ok_or(ContractError::ArithmeticOverflow)
 }
 
-pub fn calculate_amount_after_fee(amount: i128, fee_rate_bps: i128) -> i128 {
+/// `amount` minus [`calculate_fee`]; see there for the error contract.
+pub fn calculate_amount_after_fee(
+    amount: i128,
+    fee_rate_bps: i128,
+) -> Result<i128, ContractError> {
     amount
-        .checked_sub(calculate_fee(amount, fee_rate_bps))
-        .expect("Underflow in amount after fee calculation")
+        .checked_sub(calculate_fee(amount, fee_rate_bps)?)
+        .ok_or(ContractError::ArithmeticOverflow)
 }
 
 /// Calculate median using in-place quickselect algorithm
@@ -467,21 +541,24 @@ fn partition_inplace(values: &mut soroban_sdk::Vec<i128>, left: i32, right: i32)
     i + 1
 }
 
-/// Calculate percentage deviation
+/// Deviation of `value1` from `value2` in basis points.
+///
+/// Never panics (AC-028): a zero base, or any intermediate that overflows
+/// `i128`, saturates to `i128::MAX`. Callers compare the result against a
+/// threshold, so saturation fails safe — it reads as "maximally deviant" and
+/// trips the outlier / emergency path instead of aborting the contract.
 pub fn calculate_deviation(value1: i128, value2: i128) -> i128 {
     if value2 == 0 {
         return i128::MAX;
     }
     let diff = if value1 > value2 {
-        value1
-            .checked_sub(value2)
-            .expect("Underflow in deviation diff")
+        value1.checked_sub(value2)
     } else {
-        value2
-            .checked_sub(value1)
-            .expect("Underflow in deviation diff")
+        value2.checked_sub(value1)
     };
-    (diff * BASIS_POINTS) / value2
+    diff.and_then(|d| d.checked_mul(BASIS_POINTS))
+        .and_then(|v| v.checked_div(value2))
+        .unwrap_or(i128::MAX)
 }
 
 /// Check if a contract is initialized by verifying the version key exists.
