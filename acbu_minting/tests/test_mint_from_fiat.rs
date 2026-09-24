@@ -246,7 +246,7 @@ fn test_mint_from_fiat_success() {
     let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token_id);
     assert_eq!(acbu_client.balance(&recipient), acbu, "acbu_client.balance(&recipient) should equal acbu");
     // AC-009 (#732): total supply must include the treasury fee mint.
-    let expected_fee = shared::calculate_fee(50 * DECIMALS, 50);
+    let expected_fee = shared::calculate_fee(50 * DECIMALS, 50).unwrap();
     assert!(expected_fee > 0, "fee must be positive for this scenario");
     assert_eq!(
         client.get_total_supply(),

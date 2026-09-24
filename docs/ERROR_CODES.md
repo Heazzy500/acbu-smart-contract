@@ -21,6 +21,8 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 11 | `InvalidRecipient` | The recipient address is invalid for this operation (e.g. a contract address where a classic account is required). |
 | 12 | `InvalidVersion` | WASM upgrade rejected: `new_version` must be greater than the stored version. |
 | 13 | `SlippageExceeded` | The computed output amount is below the caller-supplied minimum acceptable output (`min_*_out`), indicating that same-block oracle movement would cause unacceptable slippage for this transaction. |
+| 14 | `ArithmeticOverflow` | A fee, deviation or amount computation overflowed `i128`. Returned instead of aborting the contract so callers can surface a recoverable error. |
+| 15 | `InvalidCircuitPeer` | A circuit-breaker peer list is invalid: too many entries, a duplicate, or the contract itself. |
 | 9999 | `Unknown` | unknown error |
 
 ## `shared / reentrancy guard` - `ReentrancyError`
@@ -151,6 +153,8 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 5025 | `SupplyMismatch` | supplied value does not match on-chain supply |
 | 5027 | `NegativeSupply` | negative supply |
 | 5026 | `SlippageExceeded` | The computed ACBU output is below the caller-supplied `min_acbu_out` floor, indicating that same-block oracle movement would cause unacceptable slippage. The transaction should be retried with updated parameters. |
+| 5028 | `ArithmeticOverflow` | A fee computation overflowed `i128` (AC-028). |
+| 5029 | `InvalidCircuitPeer` | The circuit-breaker peer list is invalid (too long, duplicate, or self). |
 | 5999 | `Unknown` | unknown minting error |
 
 ## `acbu_oracle` - `OracleError`
@@ -183,6 +187,7 @@ Clients map `invoke_contract` / simulation failures using the contract error `u3
 | 7024 | `CurrencyNotRegistered` | currency not registered |
 | 7025 | `InsufficientEmergencyVotes` | Emergency vote cast but consensus not yet reached — caller must wait for more validators to submit corroborating emergency rates. |
 | 7026 | `AdminDeviationTooLarge` | AC-013 (#736): admin rate override deviates beyond the per-currency emergency threshold — larger moves must go through `cast_emergency_vote` + `update_rate` N-of-M validator consensus instead. |
+| 7027 | `EmergencyCooldownActive` | An emergency (above-threshold) update was attempted before `EMERGENCY_UPDATE_COOLDOWN_SECONDS` elapsed since the currency's last update. Emergency consensus lifts the regular interval, not this floor. |
 | 7999 | `Unknown` | unknown oracle error |
 
 ## `acbu_reserve_tracker` - `ReserveTrackerError`
