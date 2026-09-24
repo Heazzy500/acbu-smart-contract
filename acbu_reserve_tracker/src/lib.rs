@@ -113,16 +113,6 @@ const DATA_KEY: DataKey = DataKey {
     attestation_ts: symbol_short!("ATT_TS"),
 };
 
-/// A single currency attestation entry in a Merkle tree, submitted by the custodian.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttestationLeaf {
-    pub currency: CurrencyCode,
-    pub amount: i128,
-    pub value_usd: i128,
-    pub timestamp: u64,
-}
-
 /// Admin rotation timelock: the pending admin must wait this long before
 /// claiming ownership, giving the current admin a window to cancel a mistaken
 /// or malicious transfer.
