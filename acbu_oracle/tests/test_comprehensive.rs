@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use acbu_oracle::{OracleContract, OracleContractClient};
+use acbu_oracle::{OracleContract, OracleContractClient, EMERGENCY_UPDATE_COOLDOWN_SECONDS};
 use shared::{CurrencyCode, OutlierDetectionEvent, RateUpdateEvent, STALE_RATE_MAX_LEDGERS};
 use soroban_sdk::{
     symbol_short,
@@ -291,8 +291,9 @@ fn test_update_rate_with_emergency_deviation_bypasses_interval() {
     // Seed an initial rate.
     submit_quorum(&env, &client, &validators, &ngn, &initial_rate, &sources);
 
-    // Advance only 1000 seconds — well within the 6h update interval.
-    env.ledger().with_mut(|l| l.timestamp += 1000);
+    // Advance past the emergency cooldown (AC-029) but well within the 6h
+    // update interval.
+    env.ledger().with_mut(|l| l.timestamp += EMERGENCY_UPDATE_COOLDOWN_SECONDS + 1);
     let emergency_rate = 1_060_000i128; // 6% above threshold (>5%)
     let mut emergency_sources = Vec::new(&env);
     emergency_sources.push_back(1_060_000i128);
