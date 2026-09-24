@@ -5,7 +5,8 @@ use soroban_sdk::{
 };
 
 use shared::{
-    calculate_fee, check_oracle_freshness, reentrancy_guard, BurnEvent, ContractError,
+    any_circuit_peer_paused, calculate_fee, check_oracle_freshness, reentrancy_guard,
+    validate_circuit_peers, BurnEvent, ContractError,
     ContractPhase, CurrencyCode, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION,
     DECIMALS, MIN_BURN_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS, ORACLE_GET_BASKET_WEIGHT,
     ORACLE_GET_CURRENCIES, ORACLE_GET_RATE_WITH_TS, ORACLE_GET_S_TOKEN_ADDR,
@@ -27,6 +28,9 @@ pub struct DataKey {
     pub min_burn_amount: Symbol,
     pub pending_admin: Symbol,
     pub pending_admin_eligible_at: Symbol,
+    /// `Vec<Address>` of circuit-breaker peers (minting, reserve tracker, …) whose
+    /// pause also halts redemption (AC-030).
+    pub circuit_peers: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -42,6 +46,7 @@ const DATA_KEY: DataKey = DataKey {
     min_burn_amount: symbol_short!("MIN_BURN"),
     pending_admin: symbol_short!("PEND_ADM"),
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
+    circuit_peers: symbol_short!("CB_PEERS"),
 };
 
 
@@ -142,7 +147,7 @@ impl BurningContract {
         min_stoken_out: Option<i128>,
     ) -> i128 {
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         Self::validate_recipient(&env, &recipient);
         Self::extend_instance_ttl(&env);
@@ -198,7 +203,8 @@ impl BurningContract {
             vec![&env, currency.clone().into_val(&env)],
         );
 
-        let fee = calculate_fee(acbu_amount, fee_single);
+        let fee = calculate_fee(acbu_amount, fee_single)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(fee)
             .expect("Underflow in net acbu calculation");
@@ -259,7 +265,7 @@ impl BurningContract {
         acbu_amount: i128,
         min_stokens_out: Option<Vec<i128>>,
     ) -> Vec<i128> {
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         Self::extend_instance_ttl(&env);
 
@@ -344,7 +350,8 @@ impl BurningContract {
             env.panic_with_error(ContractError::InvalidRate);
         }
 
-        let total_fee = calculate_fee(acbu_amount, fee_rate);
+        let total_fee = calculate_fee(acbu_amount, fee_rate)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(total_fee)
             .expect("Underflow in net acbu");
@@ -637,7 +644,45 @@ impl BurningContract {
             .get(&DATA_KEY.pending_admin_eligible_at)
     }
 
+    /// Link circuit-breaker peers (admin only, AC-030).
+    ///
+    /// While any peer's `is_paused()` returns `true` — or a peer cannot be
+    /// queried — every redemption path reverts with `Paused`, exactly as if this
+    /// contract were paused. Link the minting contract and the reserve tracker
+    /// here (and this contract on their side) so tripping any one breaker stops
+    /// value movement end to end. Pass an empty list to unlink. At most
+    /// `MAX_CIRCUIT_PEERS` entries; duplicates and this contract are rejected.
+    pub fn set_circuit_peers(env: Env, peers: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+        if let Err(e) = validate_circuit_peers(&env, &peers) {
+            env.panic_with_error(e);
+        }
+        env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
+        env.events()
+            .publish((symbol_short!("cb_peers"),), peers);
+    }
+
+    /// Return the linked circuit-breaker peers (empty if none).
+    pub fn get_circuit_peers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns `true` if redemption is halted: this contract is paused or any
+    /// linked circuit-breaker peer is paused (or unreachable).
+    pub fn is_halted(env: Env) -> bool {
+        let peers = Self::get_circuit_peers(env.clone());
+        Self::is_paused(env.clone()) || any_circuit_peer_paused(&env, &peers)
+    }
+
     /// Returns `true` if the contract is currently paused.
+    ///
+    /// Reports **local** state only: circuit-breaker peers call this on each
+    /// other, so it must never query peers itself. See [`Self::is_halted`].
     pub fn is_paused(env: Env) -> bool {
         let phase: ContractPhase = env
             .storage()
@@ -784,6 +829,20 @@ impl BurningContract {
             .get(&DATA_KEY.phase)
             .unwrap_or(ContractPhase::Active);
         if matches!(phase, ContractPhase::Paused) {
+            env.panic_with_error(ContractError::Paused);
+        }
+    }
+
+    /// Guard for value-moving paths: local pause plus every circuit-breaker
+    /// peer (AC-030).
+    fn check_circuit(env: &Env) {
+        Self::check_paused(env);
+        let peers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(env));
+        if any_circuit_peer_paused(env, &peers) {
             env.panic_with_error(ContractError::Paused);
         }
     }

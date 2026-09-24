@@ -6,7 +6,8 @@ use soroban_sdk::{
 };
 
 use shared::{
-    calculate_deviation, median, CurrencyCode, DataKey as SharedDataKey, EmergencyBypassEvent,
+    calculate_deviation, check_oracle_ledger_freshness, median, CurrencyCode,
+    DataKey as SharedDataKey, EmergencyBypassEvent,
     EmergencyConfig, EmergencyVote, EmergencyVoteCastEvent, OutlierDetectionEvent, RateData,
     RateUpdateEvent, BASIS_POINTS, CONTRACT_VERSION, EMERGENCY_THRESHOLD_BPS,
     MAX_VALIDATORS, OUTLIER_THRESHOLD_BPS, STALE_RATE_MAX_LEDGERS, UPDATE_INTERVAL_SECONDS,
@@ -47,6 +48,10 @@ pub enum OracleError {
     /// emergency threshold — larger moves must go through `cast_emergency_vote`
     /// + `update_rate` N-of-M validator consensus instead.
     AdminDeviationTooLarge = 7026,
+    /// An emergency (above-threshold) update was attempted before
+    /// `EMERGENCY_UPDATE_COOLDOWN_SECONDS` elapsed since the currency's last
+    /// update. Emergency consensus lifts the regular interval, not this floor.
+    EmergencyCooldownActive = 7027,
     Unknown = 7999,
 }
 
@@ -79,6 +84,7 @@ impl Display for OracleError {
             Self::CurrencyNotRegistered => "currency not registered",
             Self::InsufficientEmergencyVotes => "emergency vote cast - waiting for N-of-M validator consensus",
             Self::AdminDeviationTooLarge => "admin rate deviation exceeds emergency threshold",
+            Self::EmergencyCooldownActive => "emergency update cooldown has not elapsed",
             Self::Unknown => "unknown oracle error",
         };
         f.write_str(message)
@@ -188,6 +194,13 @@ pub struct RateSubmittedEvent {
     pub required: u32,
     pub timestamp: u64,
 }
+
+/// Minimum time between an emergency (above-threshold) update and the previous
+/// update of the same currency (AC-029). N-of-M consensus lifts the regular
+/// update interval, but without a floor a quorum could still whipsaw a rate
+/// with back-to-back emergency writes. One hour matches the vote TTL, so each
+/// emergency round needs fresh votes.
+pub const EMERGENCY_UPDATE_COOLDOWN_SECONDS: u64 = 3_600;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -440,9 +453,14 @@ impl OracleContract {
     /// beyond the per-currency emergency threshold **and** at least `min_signatures`
     /// validators have all independently cast emergency votes via
     /// [`Self::cast_emergency_vote`] (N-of-M consensus). A single validator can no
-    /// longer unilaterally bypass the time-lock. Rejects timestamps older than the
-    /// stored rate. The `_timestamp` parameter is ignored; the ledger timestamp is
-    /// used. Emits `RateUpdateEvent` and, when an emergency bypass fires, also emits
+    /// longer unilaterally bypass the time-lock. Even with consensus, an emergency
+    /// update is refused until [`EMERGENCY_UPDATE_COOLDOWN_SECONDS`] have passed since
+    /// the currency's previous update. Once the stored rate is older than
+    /// [`STALE_RATE_MAX_LEDGERS`] — the point at which every read path rejects it —
+    /// the interval no longer blocks a refresh, so write-side and read-side
+    /// staleness agree. Rejects timestamps older than the stored rate. The
+    /// `_timestamp` parameter is ignored; the ledger timestamp is used. Emits
+    /// `RateUpdateEvent` and, when an emergency bypass fires, also emits
     /// `EmergencyBypassEvent`.
     pub fn update_rate(
         env: Env,
@@ -517,8 +535,17 @@ impl OracleContract {
         // Within the update interval only an emergency round may proceed. The
         // emergency votes are checked here for every submission in the round and
         // consumed only when the round commits.
+        //
+        // AC-027: the interval is judged on both clocks. Read paths reject a rate
+        // by ledger age (unforgeable), so once the stored rate is past
+        // STALE_RATE_MAX_LEDGERS a wall-clock interval that has not yet elapsed
+        // (e.g. slow or skewed close times) must not block the refresh —
+        // otherwise the feed is unusable yet cannot be updated.
         let within_interval = match existing_rate {
-            Some(ref existing) => current_time < existing.timestamp + update_interval,
+            Some(ref existing) => {
+                current_time < existing.timestamp.saturating_add(update_interval)
+                    && check_oracle_ledger_freshness(&env, existing.ledger, STALE_RATE_MAX_LEDGERS)
+            }
             None => false,
         };
         let mut allow_update = false;
@@ -526,6 +553,15 @@ impl OracleContract {
             let emergency_threshold = Self::get_emergency_threshold_bps(&env, &currency);
             let deviation = calculate_deviation(rate, existing.rate_usd);
             if deviation > emergency_threshold {
+                // AC-029: consensus lifts the regular interval, not the cooldown.
+                if within_interval
+                    && current_time
+                        < existing
+                            .timestamp
+                            .saturating_add(EMERGENCY_UPDATE_COOLDOWN_SECONDS)
+                {
+                    env.panic_with_error(OracleError::EmergencyCooldownActive);
+                }
                 // Check whether N-of-M consensus already exists (votes were
                 // pre-registered via cast_emergency_vote).
                 allow_update =
@@ -1411,7 +1447,7 @@ impl OracleContract {
             env.panic_with_error(OracleError::RateNotInitialized);
         }
 
-        let rate = (weighted_sum * BASIS_POINTS) / total_weight;
+        let rate = weighted_sum / total_weight;
         let oldest_timestamp = if oldest_timestamp == u64::MAX {
             0
         } else {
@@ -1437,9 +1473,8 @@ impl OracleContract {
     }
 
     fn assert_rate_fresh(env: &Env, rate_data: &RateData, currency: &CurrencyCode) {
-        let current_ledger = env.ledger().sequence();
-        let age = current_ledger.saturating_sub(rate_data.ledger);
-        if age > STALE_RATE_MAX_LEDGERS {
+        if !check_oracle_ledger_freshness(env, rate_data.ledger, STALE_RATE_MAX_LEDGERS) {
+            let current_ledger = env.ledger().sequence();
             env.events().publish(
                 (symbol_short!("stale_rt"),),
                 (currency.clone(), rate_data.ledger, current_ledger, STALE_RATE_MAX_LEDGERS),

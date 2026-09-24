@@ -78,6 +78,8 @@ pub struct DataKey {
     pub custodian: Symbol,
     pub attested_root: Symbol,
     pub attestation_ts: Symbol,
+    /// `bool` reserve circuit breaker (AC-030).
+    pub paused: Symbol,
 }
 
 /// A single reserve entry committed in the Merkle attestation tree.
@@ -111,6 +113,7 @@ const DATA_KEY: DataKey = DataKey {
     custodian: symbol_short!("CUSTODIN"),
     attested_root: symbol_short!("ATT_ROOT"),
     attestation_ts: symbol_short!("ATT_TS"),
+    paused: symbol_short!("PAUSED"),
 };
 
 /// Admin rotation timelock: the pending admin must wait this long before
@@ -193,9 +196,9 @@ impl ReserveTrackerContract {
         let last_call: Option<u64> = env.storage().instance().get(&DATA_KEY.last_verify_call);
         if let Some(last) = last_call {
             if now.saturating_sub(last) < VERIFY_RESERVES_COOLDOWN_SECONDS {
-                if let Some(cached) =
-                    env.storage().instance().get(&DATA_KEY.last_verify_result)
-                {
+                let cached: Option<bool> =
+                    env.storage().instance().get(&DATA_KEY.last_verify_result);
+                if let Some(cached) = cached {
                     return cached;
                 }
             }
@@ -300,13 +303,54 @@ impl ReserveTrackerContract {
         total_usd
     }
 
+    // -----------------------------------------------------------------------
+    // Reserve circuit breaker (AC-030)
+    //
+    // Minting and burning both gate on `is_reserve_sufficient`, so tripping
+    // this breaker halts mint and redeem together without any extra wiring.
+    // Contracts that link the tracker as a circuit-breaker peer also see it
+    // through `is_paused`.
+    // -----------------------------------------------------------------------
+
+    /// Trip the reserve circuit breaker (admin only). While paused,
+    /// [`Self::is_reserve_sufficient`] reports `false`.
+    pub fn pause(env: Env) {
+        Self::check_admin(&env);
+        let admin = Self::get_admin(env.clone());
+        env.storage().instance().set(&DATA_KEY.paused, &true);
+        env.events()
+            .publish((symbol_short!("paused"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Reset the reserve circuit breaker (admin only).
+    pub fn unpause(env: Env) {
+        Self::check_admin(&env);
+        let admin = Self::get_admin(env.clone());
+        env.storage().instance().set(&DATA_KEY.paused, &false);
+        env.events()
+            .publish((symbol_short!("unpaused"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Returns `true` if the reserve circuit breaker is tripped. Reports local
+    /// state only, so it is safe for circuit-breaker peers to call.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.paused)
+            .unwrap_or(false)
+    }
+
     /// Return `true` if total reserve USD value backs `total_acbu_supply` at or
     /// above the configured minimum reserve ratio (default 100%).
     ///
     /// Sums the USD value of all stored reserves and compares it against the ACBU
-    /// supply valued at the oracle's ACBU/USD rate. Trivially returns `true` when
-    /// supply is non-positive or values to zero.
+    /// supply valued at the oracle's ACBU/USD rate. Always `false` while the
+    /// reserve circuit breaker is tripped (see [`Self::pause`]); otherwise
+    /// trivially `true` when supply is non-positive or values to zero.
     pub fn is_reserve_sufficient(env: Env, total_acbu_supply: i128) -> bool {
+        if Self::is_paused(env.clone()) {
+            return false;
+        }
         if total_acbu_supply <= 0 {
             return true;
         }

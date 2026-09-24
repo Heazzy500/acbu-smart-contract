@@ -3,11 +3,12 @@ use core::fmt::{self, Display};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, vec, Address,
-    Bytes, BytesN, Env, IntoVal, String as SorobanString, Symbol,
+    Bytes, BytesN, Env, IntoVal, String as SorobanString, Symbol, Vec,
 };
 
 use shared::{
-    calculate_amount_after_fee, calculate_fee, check_oracle_freshness, ContractPhase, CurrencyCode,
+    any_circuit_peer_paused, calculate_amount_after_fee, calculate_fee, check_oracle_freshness,
+    validate_circuit_peers, ContractPhase, CurrencyCode,
     DataKey as SharedDataKey, MintEvent, reentrancy_guard, BASIS_POINTS, CONTRACT_VERSION, DECIMALS,
     MAX_MINT_AMOUNT, MAX_TOTAL_SUPPLY, MIN_MINT_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS,
     ORACLE_GET_BASKET_WEIGHT, ORACLE_GET_CURRENCIES, ORACLE_GET_RATE, ORACLE_GET_RATE_WITH_TS,
@@ -60,6 +61,9 @@ pub struct DataKey {
     pub proof_prefix: Symbol,
     /// Monotonically increasing nonce used to generate unique transaction IDs.
     pub tx_nonce: Symbol,
+    /// `Vec<Address>` of circuit-breaker peers (burning, reserve tracker, …) whose
+    /// pause also halts minting (AC-030).
+    pub circuit_peers: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -85,6 +89,7 @@ const DATA_KEY: DataKey = DataKey {
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
     proof_prefix: symbol_short!("PRF_SET"),
     tx_nonce: symbol_short!("TX_NONCE"),
+    circuit_peers: symbol_short!("CB_PEERS"),
 };
 
 /// Admin rotation timelock: the pending admin must wait this long before
@@ -130,6 +135,10 @@ pub enum MintingError {
     /// floor, indicating that same-block oracle movement would cause unacceptable
     /// slippage. The transaction should be retried with updated parameters.
     SlippageExceeded = 5026,
+    /// A fee computation overflowed `i128` (AC-028).
+    ArithmeticOverflow = 5028,
+    /// The circuit-breaker peer list is invalid (too long, duplicate, or self).
+    InvalidCircuitPeer = 5029,
     Unknown = 5999,
 }
 
@@ -163,6 +172,8 @@ impl Display for MintingError {
             Self::SupplyMismatch => "supplied value does not match on-chain supply",
             Self::SlippageExceeded => "output below minimum: slippage exceeded",
             Self::NegativeSupply => "negative supply",
+            Self::ArithmeticOverflow => "arithmetic overflow in fee calculation",
+            Self::InvalidCircuitPeer => "invalid circuit-breaker peer",
             Self::Unknown => "unknown minting error",
         };
         f.write_str(message)
@@ -307,7 +318,7 @@ impl MintingContract {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
@@ -338,6 +349,7 @@ impl MintingContract {
             .instance()
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let mut total_supply: i128 = env
             .storage()
             .instance()
@@ -354,11 +366,19 @@ impl MintingContract {
             env.panic_with_error(MintingError::OracleStale);
         }
 
-        let usdc_after_fee = calculate_amount_after_fee(usdc_amount, fee_rate);
+        let usdc_after_fee = calculate_amount_after_fee(usdc_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usdc_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .unwrap_or_else(|| env.panic_with_error(MintingError::InvalidMintAmount));
+
+        let fee_usd = calculate_fee(usdc_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
 
         // Slippage guard: reject if computed output is below caller's minimum.
         if let Some(floor) = min_acbu_out {
@@ -369,6 +389,7 @@ impl MintingContract {
 
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -380,7 +401,9 @@ impl MintingContract {
             env.panic_with_error(MintingError::InsufficientReserves);
         }
 
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -395,7 +418,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usdc_amount, fee_rate);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
 
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_usdc");
         let mint_event = MintEvent {
@@ -427,7 +454,7 @@ impl MintingContract {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
@@ -478,7 +505,8 @@ impl MintingContract {
             env.panic_with_error(MintingError::OracleStale);
         }
 
-        let fee_acbu = calculate_fee(acbu_amount, fee_rate);
+        let fee_acbu = calculate_fee(acbu_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let net_mint = acbu_amount
             .checked_sub(fee_acbu)
             .expect("Underflow in net mint calculation");
@@ -511,7 +539,9 @@ impl MintingContract {
             .expect("Overflow in usd total calculation");
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -604,7 +634,7 @@ impl MintingContract {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
@@ -630,6 +660,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -674,14 +705,23 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -694,7 +734,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -705,7 +747,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_single");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -738,7 +784,7 @@ impl MintingContract {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
         if operator != expected_operator {
             env.panic_with_error(MintingError::UnauthorizedOperator);
@@ -772,6 +818,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -812,14 +859,23 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -832,7 +888,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -844,7 +902,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_demo");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -880,7 +942,7 @@ impl MintingContract {
         // Re-entrancy guard
         let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
 
         // Strict access control: only operator (fintech backend) can call
@@ -967,7 +1029,8 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_rate);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
@@ -977,7 +1040,12 @@ impl MintingContract {
         // must count toward both the supply-cap/reserve projection and the
         // tracked total supply — otherwise `get_total_supply()` drifts below
         // the real circulating supply after every fee-bearing fiat mint.
-        let fee = calculate_fee(usd_gross, fee_rate);
+        let fee_usd = calculate_fee(usd_gross, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
         let minted_total = acbu_amount
             .checked_add(fee)
             .expect("Overflow in minted amount calculation");
@@ -1047,8 +1115,8 @@ impl MintingContract {
         currency: CurrencyCode,
         amount: i128,
     ) {
-        let _guard = reentrancy_guard::acquire_guard(&env);
-        Self::check_paused(&env);
+        reentrancy_guard::acquire_guard(&env);
+        Self::check_circuit(&env);
 
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
@@ -1262,6 +1330,40 @@ impl MintingContract {
         env.events().publish((symbol_short!("unpaused"),), event);
     }
 
+    /// Link circuit-breaker peers (admin only, AC-030).
+    ///
+    /// While any peer's `is_paused()` returns `true` — or a peer cannot be
+    /// queried — every mint path reverts with `Paused`, exactly as if this
+    /// contract were paused. Link the burning contract and the reserve tracker
+    /// here (and this contract on their side) so tripping any one breaker stops
+    /// value movement end to end. Pass an empty list to unlink. At most
+    /// `MAX_CIRCUIT_PEERS` entries; duplicates and this contract are rejected.
+    pub fn set_circuit_peers(env: Env, peers: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        if validate_circuit_peers(&env, &peers).is_err() {
+            env.panic_with_error(MintingError::InvalidCircuitPeer);
+        }
+        env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
+        env.events()
+            .publish((symbol_short!("cb_peers"),), peers);
+    }
+
+    /// Return the linked circuit-breaker peers (empty if none).
+    pub fn get_circuit_peers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns `true` if minting is halted: this contract is paused or any
+    /// linked circuit-breaker peer is paused (or unreachable).
+    pub fn is_halted(env: Env) -> bool {
+        let peers = Self::get_circuit_peers(env.clone());
+        Self::is_paused(env.clone()) || any_circuit_peer_paused(&env, &peers)
+    }
+
     /// Set the basket/USDC mint fee in basis points (admin only).
     ///
     /// Reverts if paused or `fee_rate_bps` is outside `0..=BASIS_POINTS`. Emits a
@@ -1329,6 +1431,9 @@ impl MintingContract {
     }
 
     /// Return `true` if the contract is currently paused.
+    ///
+    /// Reports **local** state only: circuit-breaker peers call this on each
+    /// other, so it must never query peers itself. See [`Self::is_halted`].
     pub fn is_paused(env: Env) -> bool {
         let phase: ContractPhase = env
             .storage()
@@ -1566,6 +1671,21 @@ impl MintingContract {
         }
     }
 
+    /// Guard for value-moving paths: local pause plus every circuit-breaker
+    /// peer (AC-030). Admin configuration keeps using [`Self::check_paused`] so
+    /// a tripped peer never locks the admin out of recovery.
+    fn check_circuit(env: &Env) {
+        Self::check_paused(env);
+        let peers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(env));
+        if any_circuit_peer_paused(env, &peers) {
+            env.panic_with_error(MintingError::Paused);
+        }
+    }
+
     /// Return the stored contract version (0 if never set).
     pub fn get_version(env: Env) -> u32 {
         env.storage()
@@ -1664,17 +1784,32 @@ fn next_tx_nonce(env: &Env) -> u64 {
 
 // ---------------------------------------------------------------------------
 // Proof-replay helpers: used by mint_from_demo_fiat to prevent double-spend.
+// C-070: persistent proof keys must have a bounded lifetime so storage does
+// not grow unboundedly across every processed deposit. Fiat proofs only need
+// replay protection for the off-chain settlement window (a few days at most),
+// so we keep keys alive for 60 days and renew on read — any expired key is
+// treated as unused and can be re-inserted.
 // ---------------------------------------------------------------------------
+const PROOF_TTL: u32 = 5_184_000;
+const PROOF_TTL_THRESHOLD: u32 = 2_592_000;
+
 fn check_proof_unused(env: &Env, proof_id: &SorobanString) -> bool {
-    !env.storage()
-        .persistent()
-        .has(&(DATA_KEY.proof_prefix, proof_id.clone()))
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    let has = env.storage().persistent().has(&key);
+    if has {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
+    }
+    !has
 }
 
 fn mark_proof_used(env: &Env, proof_id: &SorobanString) {
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    env.storage().persistent().set(&key, &true);
     env.storage()
         .persistent()
-        .set(&(DATA_KEY.proof_prefix, proof_id.clone()), &true);
+        .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
 }
 
 // ---------------------------------------------------------------------------
