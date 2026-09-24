@@ -74,9 +74,9 @@ impl ZkGate {
         verified
     }
 
-    fn require_contract_vrf(env: &Env, vrf: &Address) {
-        if *vrf == env.current_contract_address() {
-            env.panic_with_error(ZkGateError::InvalidVrf);
+    fn require_contract_vrf(_env: &Env, vrf: &Address) {
+        if *vrf == _env.current_contract_address() {
+            _env.panic_with_error(ZkGateError::InvalidVrf);
         }
     }
 }
