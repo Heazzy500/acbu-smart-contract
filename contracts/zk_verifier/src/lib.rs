@@ -17,25 +17,25 @@
 //!
 //! ```text
 //! DataKey::Nullifier(BytesN<32>)  →  bool      (ledger-TTL-bumped on each verify)
-//! DataKey::Verified(Address)      →  bool      (ledger-TTL-bumped on each verify)
+//! DataKey::Verified(Address)      →  VerificationRecord (fixed validity deadline)
 //! DataKey::AttestedCommitment(BytesN<32>) → bool (ledger-TTL-bumped on register)
 //! DataKey::Admin                  →  Address   (instance — single scalar, bounded)
 //! DataKey::Paused                 →  bool      (instance — single scalar, bounded)
 //! ```
 //!
-//! Each entry lives in `persistent` storage and receives a TTL bump on every
-//! successful verification.  Entries that are never re-verified expire
-//! automatically after `NULLIFIER_TTL_LEDGERS`, keeping storage bounded.
+//! Each entry lives in `persistent` storage. Nullifiers and attestations use a
+//! bounded storage TTL, while verification records carry an immutable validity
+//! deadline and can also be revoked by the administrator.
 //!
 //! Instance storage is used **only** for the small, fixed set of contract
 //! configuration fields (admin, paused flag) whose combined size is a known
 //! constant that cannot grow at runtime.
 
+use shared::ContractError;
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, Vec,
 };
-use shared::ContractError;
 
 // ---------------------------------------------------------------------------
 // Storage TTL constants
@@ -83,7 +83,7 @@ pub enum DataKey {
     /// Stored in *persistent* storage so entries expire individually via TTL
     /// rather than accumulating in a single unbounded instance `Map`.
     ScopedNullifier(BytesN<32>, BytesN<32>),
-    /// Verified wallet — keyed per address.
+    /// Verified wallet record — keyed per address and bounded by its deadline.
     ///
     /// Stored in *persistent* storage for the same reason as `Nullifier`.
     Verified(Address),
@@ -151,10 +151,8 @@ impl ZkVerifier {
             NULLIFIER_TTL_LEDGERS,
         );
 
-        env.events().publish(
-            (symbol_short!("attested"), commitment.clone()),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("attested"), commitment.clone()), ());
 
         Self::extend_instance_ttl(&env);
     }
@@ -176,7 +174,7 @@ impl ZkVerifier {
     }
 
     /// Record a successful proof verification for `wallet` with the given
-    /// `nullifier` and credential `commitment`.
+    /// named public inputs, including the nullifier and credential commitment.
     ///
     /// # AZ-014
     ///
@@ -278,19 +276,34 @@ impl ZkVerifier {
             NULLIFIER_TTL_LEDGERS,
         );
 
-        // Mark the wallet as verified.
+        // Store an immutable validity deadline. Reads never extend this deadline,
+        // so a stale credential cannot remain valid merely because it is queried.
+        let expires_at_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(VERIFICATION_VALIDITY_LEDGERS);
+        let record = VerificationRecord {
+            expires_at_ledger,
+            nullifier: nullifier.clone(),
+            policy: policy.clone(),
+        };
         env.storage()
             .persistent()
-            .set(&DataKey::Verified(wallet.clone()), &true);
+            .set(&DataKey::Verified(wallet.clone()), &record);
         env.storage().persistent().extend_ttl(
             &DataKey::Verified(wallet.clone()),
-            NULLIFIER_TTL_THRESHOLD,
-            NULLIFIER_TTL_LEDGERS,
+            VERIFICATION_VALIDITY_LEDGERS / 2,
+            VERIFICATION_VALIDITY_LEDGERS,
         );
 
         env.events().publish(
-            (symbol_short!("verified"), wallet.clone()),
-            (nullifier,),
+            (symbol_short!("verified"),),
+            VerifiedEvent {
+                user: wallet,
+                nullifier,
+                policy,
+                expires_at_ledger,
+            },
         );
 
         Self::extend_instance_ttl(&env);
@@ -298,20 +311,22 @@ impl ZkVerifier {
 
     // ── Read helpers ────────────────────────────────────────────────────────
 
-    /// Returns `true` if `wallet` has a live verified entry.
+    /// Returns `true` only while `wallet` has a non-expired verification.
     pub fn is_verified(env: Env, wallet: Address) -> bool {
         let key = DataKey::Verified(wallet);
-        if env.storage().persistent().has(&key) {
-            // Bump TTL on read so actively-queried entries stay alive.
-            env.storage().persistent().extend_ttl(
-                &key,
-                NULLIFIER_TTL_THRESHOLD,
-                NULLIFIER_TTL_LEDGERS,
-            );
-            true
-        } else {
-            false
-        }
+        env.storage()
+            .persistent()
+            .get::<_, VerificationRecord>(&key)
+            .is_some_and(|record| env.ledger().sequence() < record.expires_at_ledger)
+    }
+
+    /// Return the current verification record when it is still valid.
+    pub fn verification(env: Env, wallet: Address) -> Option<VerificationRecord> {
+        let key = DataKey::Verified(wallet);
+        env.storage()
+            .persistent()
+            .get::<_, VerificationRecord>(&key)
+            .filter(|record| env.ledger().sequence() < record.expires_at_ledger)
     }
 
     /// Returns `true` if `nullifier` has already been spent for `commitment`.
@@ -335,6 +350,27 @@ impl ZkVerifier {
         Self::check_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::extend_instance_ttl(&env);
+    }
+
+    /// Revoke a wallet's verification immediately. Only the administrator may
+    /// revoke, and successful revocations are emitted for off-chain indexers.
+    pub fn revoke_verification(env: Env, wallet: Address) -> bool {
+        Self::check_admin(&env);
+        let key = DataKey::Verified(wallet.clone());
+        if !env.storage().persistent().has(&key) {
+            return false;
+        }
+
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("revoked"),),
+            VerificationRevokedEvent {
+                user: wallet,
+                revoked_at_ledger: env.ledger().sequence(),
+            },
+        );
+        Self::extend_instance_ttl(&env);
+        true
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────
