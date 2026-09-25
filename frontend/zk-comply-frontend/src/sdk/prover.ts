@@ -1,20 +1,16 @@
 /**
- * Proof generation using Noir + UltraHonk in the browser.
- *
- * Matches `generate-artifacts.mjs`: Noir 1.0.0-beta.9 + bb.js 0.87.0.
- * Raw credential data never leaves the user's device.
+ * Browser prover — mirrors repo `sdk/src/prover.ts` (UltraHonk + Noir).
  */
 
 import { Noir } from "@noir-lang/noir_js";
 import { UltraHonkBackend } from "@aztec/bb.js";
 import { compile, createFileManager } from "@noir-lang/noir_wasm";
-import type { ProofArtifacts, ComplianceInput } from "./types.js";
-import { computeCommitment, computeNullifier } from "./poseidon.js";
+import type { ProofArtifacts, ComplianceInput } from "./types";
+import { computeCommitment, computeNullifier } from "./poseidon";
 
 let compiled: Awaited<ReturnType<typeof compile>> | null = null;
 let backend: UltraHonkBackend | null = null;
 
-/** Encode a bigint as a 32-byte big-endian field element. */
 export function bigintToBytes32(n: bigint): Uint8Array {
   const hex = n.toString(16).padStart(64, "0");
   const out = new Uint8Array(32);
@@ -37,18 +33,12 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-/**
- * Load and initialize the Noir circuit.
- * Call once at app startup (or before the first prove).
- */
 export async function loadCircuit(circuitSource: string): Promise<void> {
   const fm = createFileManager("/");
-  // noir_wasm FileManager: addFile is the stable API used by generate-artifacts.mjs
   (fm as { addFile: (path: string, contents: string) => void }).addFile(
     "./main.nr",
     circuitSource
   );
-
   compiled = await compile(fm, "./main.nr");
   const bytecode = (compiled as { program: { bytecode: string } }).program
     .bytecode;
@@ -58,13 +48,6 @@ export async function loadCircuit(circuitSource: string): Promise<void> {
   });
 }
 
-/**
- * Generate a zero-knowledge compliance proof.
- *
- * The raw credential data (kycLevel, countryCode, salt) never
- * leaves the browser — it's fed directly into the Wasm prover.
- * Only the proof and public inputs are returned.
- */
 export async function generateProof(
   input: ComplianceInput
 ): Promise<ProofArtifacts> {
@@ -97,7 +80,10 @@ export async function generateProof(
   );
 
   return {
-    proof: proof instanceof Uint8Array ? proof : Uint8Array.from(proof as ArrayLike<number>),
+    proof:
+      proof instanceof Uint8Array
+        ? proof
+        : Uint8Array.from(proof as ArrayLike<number>),
     publicInputs: publicInputsBytes,
     vk: vk instanceof Uint8Array ? vk : Uint8Array.from(vk as ArrayLike<number>),
     nullifier: bigintToBytes32(nullifier),
