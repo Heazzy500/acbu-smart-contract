@@ -322,6 +322,21 @@ pub enum ContractError {
     /// commitment and cannot be replayed (zk_verifier, AZ-025).
     NullifierAlreadySpent = 18,
 
+    /// The nullifier submitted in this verification has already been spent for
+    /// this commitment. Replay attempts are rejected (zk_verifier, AZ-014).
+    NullifierAlreadySpent = 18,
+
+    /// The `public_inputs` vector length does not match the expected constant
+    /// `MAX_PUBLIC_INPUTS_LEN`. Rejects malformed or oversized inputs before
+    /// any proof verification work is performed (zk_verifier, AZ-007).
+    InvalidPublicInputsLength = 19,
+
+    /// The wallet address hash encoded in `public_inputs[5]` (`wallet_address_hash`)
+    /// does not match the address that signed and submitted this transaction.
+    /// Prevents one valid proof from being replayed across different wallets
+    /// (zk_verifier, AZ-032).
+    ProofCallerMismatch = 20,
+
     Unknown = 9999,
 }
 
@@ -346,6 +361,8 @@ impl core::fmt::Display for ContractError {
             ContractError::CommitmentAlreadyAttested => write!(f, "commitment already attested"),
             ContractError::CommitmentNotAttested => write!(f, "commitment not attested"),
             ContractError::NullifierAlreadySpent => write!(f, "nullifier already spent"),
+            ContractError::InvalidPublicInputsLength => write!(f, "invalid public inputs length"),
+            ContractError::ProofCallerMismatch => write!(f, "proof caller mismatch: public_inputs[5] (wallet_address_hash) does not match submitting address (AZ-032)"),
             ContractError::Unknown => write!(f, "unknown error"),
         }
     }

@@ -33,7 +33,8 @@
 
 use shared::ContractError;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, BytesN, Env,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -54,57 +55,17 @@ const NULLIFIER_TTL_THRESHOLD: u32 = NULLIFIER_TTL_LEDGERS / 2;
 /// TTL for the instance storage (admin + paused flag).
 const INSTANCE_TTL_LEDGERS: u32 = 5_256_000; // ~1 year
 
-/// A verification remains valid for about 30 days at one ledger per 5 seconds.
-pub const VERIFICATION_VALIDITY_LEDGERS: u32 = 525_600;
-
-/// The policy proved by the caller and recorded for downstream audit/indexing.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerificationPolicy {
-    pub min_tier: u32,
-    pub country_code: u32,
-    pub requested_amount: u128,
-    pub daily_cap: u128,
-    pub already_used: u128,
-}
-
-/// Named circuit inputs. Keeping these fields structured prevents callers from
-/// silently changing their meaning by reordering or re-padding a byte vector.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerificationInputs {
-    pub min_tier: u32,
-    pub country_code: u32,
-    pub requested_amount: u128,
-    pub daily_cap: u128,
-    pub already_used: u128,
-    pub nullifier: BytesN<32>,
-    pub commitment: BytesN<32>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerificationRecord {
-    pub expires_at_ledger: u32,
-    pub nullifier: BytesN<32>,
-    pub policy: VerificationPolicy,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedEvent {
-    pub user: Address,
-    pub nullifier: BytesN<32>,
-    pub policy: VerificationPolicy,
-    pub expires_at_ledger: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerificationRevokedEvent {
-    pub user: Address,
-    pub revoked_at_ledger: u32,
-}
+/// Maximum expected length for public inputs slice.
+///
+/// | Index | Field                 | Description                              |
+/// |-------|-----------------------|------------------------------------------|
+/// |   0   | `min_tier`            | Minimum KYC tier (0–3)                   |
+/// |   1   | `country_code`        | ISO-3166-1 numeric country code          |
+/// |   2   | `requested_amount`    | Transaction amount (7 dec)               |
+/// |   3   | `daily_cap`           | Per-tier daily cap                       |
+/// |   4   | `already_used`        | Already consumed in current daily window |
+/// |   5   | `wallet_address_hash` | sha256(wallet_xdr)[0..16] as u128 (AZ-032) |
+const MAX_PUBLIC_INPUTS_LEN: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -236,19 +197,54 @@ impl ZkVerifier {
     /// attested by the trusted KYC authority first. Proofs about commitments
     /// that were never attested are rejected — the proof would otherwise be
     /// vacuous (knowledge of *some* preimage for a self-chosen commitment).
-    pub fn verify(env: Env, wallet: Address, inputs: VerificationInputs) {
+    ///
+    /// # AZ-032 — Caller binding
+    ///
+    /// `public_inputs[5]` must equal the first 16 bytes of `sha256(wallet_xdr)`
+    /// interpreted as a little-endian `u128`.  This value is also committed
+    /// inside the ZK circuit (see `zk/circuits/kyc_verifier/src/main.nr`,
+    /// parameter `wallet_address_hash`), so the proof is cryptographically
+    /// bound to exactly one wallet address.
+    ///
+    /// Without this binding an attacker who obtains *any* valid proof
+    /// (e.g. from another user) could re-submit it to mark their own address
+    /// as verified, as long as they also hold an unspent nullifier.  The
+    /// binding makes such an attack impossible: the proof can only be
+    /// accepted when `wallet` matches the address that was encoded at proving
+    /// time.
+    pub fn verify(
+        env: Env,
+        wallet: Address,
+        nullifier: BytesN<32>,
+        commitment: BytesN<32>,
+        public_inputs: Vec<u128>,
+    ) {
         wallet.require_auth();
         Self::assert_not_paused(&env);
 
-        let nullifier = inputs.nullifier.clone();
-        let commitment = inputs.commitment.clone();
-        let policy = VerificationPolicy {
-            min_tier: inputs.min_tier,
-            country_code: inputs.country_code,
-            requested_amount: inputs.requested_amount,
-            daily_cap: inputs.daily_cap,
-            already_used: inputs.already_used,
-        };
+        // AZ-007: Enforce bound on public_inputs length to prevent resource abuse.
+        if public_inputs.len() != MAX_PUBLIC_INPUTS_LEN {
+            panic_with_error!(&env, ContractError::InvalidPublicInputsLength);
+        }
+
+        // AZ-032: Verify that public_inputs[5] (wallet_address_hash) matches
+        // the caller.  We compute sha256(wallet.to_xdr()) and take the first
+        // 16 bytes as a little-endian u128.  This must equal what the prover
+        // committed to in the ZK circuit.
+        let wallet_xdr: Bytes = wallet.clone().to_xdr(&env);
+        let digest: BytesN<32> = env.crypto().sha256(&wallet_xdr);
+        let digest_bytes = digest.to_array();
+        // Take bytes [0..16] and pack as little-endian u128.
+        let mut hash_u128: u128 = 0u128;
+        let mut i: u32 = 0;
+        while i < 16 {
+            hash_u128 |= (digest_bytes[i as usize] as u128) << (i * 8);
+            i += 1;
+        }
+        let claimed: u128 = public_inputs.get_unchecked(5);
+        if hash_u128 != claimed {
+            panic_with_error!(&env, ContractError::ProofCallerMismatch);
+        }
 
         // AZ-002 — reject proofs whose commitment was never attested by the
         // trusted KYC authority.
