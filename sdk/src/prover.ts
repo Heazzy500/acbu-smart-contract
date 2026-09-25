@@ -9,7 +9,11 @@ import { Noir } from "@noir-lang/noir_js";
 import { UltraHonkBackend } from "@aztec/bb.js";
 import { compile, createFileManager } from "@noir-lang/noir_wasm";
 import type { ProofArtifacts, ComplianceInput } from "./types.js";
-import { computeCommitment, computeNullifier } from "./poseidon.js";
+import {
+  computeCommitment,
+  computeNullifier,
+  fieldToBytes32,
+} from "./poseidon.js";
 
 let compiled: Awaited<ReturnType<typeof compile>> | null = null;
 let backend: UltraHonkBackend | null = null;

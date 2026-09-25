@@ -71,6 +71,21 @@ export async function computeNullifier(
   return poseidon2Hash2(commitment, salt);
 }
 
+/** Encode a field element as an explicit, fixed-width big-endian value. */
+export function fieldToBytes32(value: bigint): Uint8Array {
+  if (value < 0n || value >= 1n << 256n) {
+    throw new RangeError("Field element must fit in 32 bytes");
+  }
+
+  const encoded = new Uint8Array(32);
+  let remaining = value;
+  for (let index = encoded.length - 1; index >= 0; index -= 1) {
+    encoded[index] = Number(remaining & 0xffn);
+    remaining >>= 8n;
+  }
+  return encoded;
+}
+
 /**
  * Compute the attested credential binding hash (AZ-002).
  *

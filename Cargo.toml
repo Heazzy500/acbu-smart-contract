@@ -10,6 +10,7 @@ members = [
     "acbu_multisig",
     "shared",
     "verifier",
+    "contracts/zk_verifier",
     "contracts/zk_gate",
 ]
 resolver = "2"
